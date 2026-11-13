@@ -102,6 +102,7 @@ def create_app(
     config: Final = settings or Settings.load()
     if environ.get("LITELLM_LICENSE"):
         raise ValueError("Daswork gateway must start without a LiteLLM license")
+    environ.pop("LITELLM_LICENSE", None)
     from litellm.proxy import proxy_server
 
     app: Final = FastAPI(

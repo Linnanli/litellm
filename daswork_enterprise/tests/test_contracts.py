@@ -1,5 +1,9 @@
 from datetime import datetime
 from decimal import Decimal
+from os import environ
+from subprocess import run
+from sys import executable
+from textwrap import dedent
 from typing import Final
 
 import pytest
@@ -79,3 +83,48 @@ def test_shanghai_budget_boundary() -> None:
     after: Final = datetime.fromisoformat("2026-11-30T16:00:00+00:00")
     assert next_month(before) == month_start(after) == after
     assert month_start(before) < month_start(after) < next_month(after)
+
+
+def test_empty_license_skips_remote_validation_at_startup() -> None:
+    result: Final = run(
+        (
+            executable,
+            "-c",
+            dedent("""
+                from sys import addaudithook
+
+                destinations = []
+
+                def deny_network(event, args):
+                    if event == "socket.getaddrinfo":
+                        destinations.append(args[0])
+                    if event in {"socket.getaddrinfo", "socket.connect"}:
+                        raise OSError("Network disabled in the startup test")
+
+                addaudithook(deny_network)
+                from daswork_enterprise.app import create_app
+                from daswork_enterprise.settings import Settings
+
+                create_app(Settings.model_validate({
+                    "config": {"general_settings": {"coordination_redis": {"host": "localhost"}}},
+                    "database_url": "postgresql://localhost/synthetic",
+                    "master_key": "synthetic-master",
+                    "admission_endpoint": "https://localhost/admission",
+                    "admission_ca": "/synthetic-ca.pem",
+                }))
+                assert "license.litellm.ai" not in destinations, destinations
+                """),
+        ),
+        env={
+            **environ,
+            "LITELLM_LICENSE": "",
+            "LITELLM_LOCAL_MODEL_COST_MAP": "true",
+            "NO_PROXY": "*",
+            "no_proxy": "*",
+        },
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=150,
+    )
+    assert result.returncode == 0, result.stderr
