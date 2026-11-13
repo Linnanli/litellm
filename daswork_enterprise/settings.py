@@ -8,7 +8,6 @@ from pydantic import BaseModel, ConfigDict, SecretStr
 from yaml import safe_load
 
 from .contracts import ADMISSION_CONTRACT, Contract
-from .models import ModelNew
 
 
 class Coordination(Contract):
@@ -37,7 +36,6 @@ class Config(BaseModel):
     model_config = ConfigDict(frozen=True, extra="ignore")
     general_settings: General
     litellm_settings: LiteLLMSettings = LiteLLMSettings()
-    model_list: tuple[ModelNew, ...] = ()
 
 
 class Settings(Contract):
@@ -53,8 +51,13 @@ class Settings(Contract):
         ca_file: Final = Path(environ["DASWORK_NATIVE_CONTROL_CA_FILE"])
         origin: Final = urlsplit(environ["DASWORK_NATIVE_CONTROL_ORIGIN"])
         if (
-            origin.scheme != "https" or not origin.hostname or origin.username or origin.password
-            or origin.path not in {"", "/"} or origin.query or origin.fragment
+            origin.scheme != "https"
+            or not origin.hostname
+            or origin.username
+            or origin.password
+            or origin.path not in {"", "/"}
+            or origin.query
+            or origin.fragment
         ):
             raise ValueError("DASWORK_NATIVE_CONTROL_ORIGIN must be an HTTPS origin")
         if not all(path.is_absolute() and path.is_file() for path in (config_file, ca_file)):
@@ -66,8 +69,8 @@ class Settings(Contract):
         if environ.get("LITELLM_LOCAL_MODEL_COST_MAP", "").casefold() != "true":
             raise ValueError("LITELLM_LOCAL_MODEL_COST_MAP must be enabled")
         master: Final = environ["LITELLM_MASTER_KEY"]
-        if not master:
-            raise ValueError("the master key is required")
+        if not master or not environ.get("LITELLM_SALT_KEY"):
+            raise ValueError("master and salt keys are required")
         return Settings(
             config=Config.model_validate(safe_load(config_file.read_bytes())),
             database_url=SecretStr(environ["DATABASE_URL"]),

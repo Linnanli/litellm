@@ -1,7 +1,7 @@
 from collections.abc import Mapping
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Annotated, Final, Literal
+from typing import Annotated, Final, Literal, TypeAlias
 from zoneinfo import ZoneInfo
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, StringConstraints, model_validator
@@ -10,12 +10,10 @@ RESPONSES_PATHS: Final = frozenset({"/responses", "/v1/responses"})
 SESSION_CONTRACT: Final = "LITELLM_SESSION_V1"
 ADMISSION_CONTRACT: Final = "LITELLM_SESSION_ADMISSION_V1"
 SHANGHAI: Final = ZoneInfo("Asia/Shanghai")
-Money = Annotated[Decimal, Field(ge=0, max_digits=30, decimal_places=18, allow_inf_nan=False)]
-Identifier = Annotated[str, StringConstraints(min_length=1, max_length=256)]
-Fingerprint = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
-ClockRange = Annotated[str, StringConstraints(pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d$")]
-CalendarDate = Annotated[str, StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}$")]
-JsonObject = Mapping[str, JsonValue]
+Money: TypeAlias = Annotated[Decimal, Field(ge=0, max_digits=30, decimal_places=18, allow_inf_nan=False)]
+Identifier: TypeAlias = Annotated[str, StringConstraints(min_length=1, max_length=256)]
+Fingerprint: TypeAlias = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
+JsonObject: TypeAlias = Mapping[str, JsonValue]
 
 
 class Contract(BaseModel):
@@ -168,61 +166,6 @@ class AdmissionReply(Contract):
     code: Literal[200]
     msg: str
     data: AdmissionData
-
-
-class Rates(Contract):
-    input_cost_per_token: Money
-    output_cost_per_token: Money
-    cache_read_input_token_cost: Money = Decimal(0)
-
-    def cost(self, prompt: int, completion: int, cached: int = 0) -> Decimal:
-        return (
-            (prompt - cached) * self.input_cost_per_token
-            + completion * self.output_cost_per_token
-            + cached * self.cache_read_input_token_cost
-        )
-
-
-class WeekdayWindow(Contract):
-    hours_utc: ClockRange
-    weekdays: Annotated[tuple[Annotated[int, Field(ge=1, le=7)], ...], Field(min_length=1, max_length=7)]
-
-
-def in_hours(window: str, when: datetime) -> bool:
-    start, end = window.split("-")
-    minute: Final = when.astimezone(UTC).strftime("%H:%M")
-    return start <= minute < end if start < end else minute >= start or minute < end
-
-
-class OffPeakRates(Rates):
-    hours_utc: tuple[ClockRange, ...] = ()
-    windows: tuple[WeekdayWindow, ...] = ()
-    weekday_timezone: Literal["UTC", "Asia/Shanghai"] | None = None
-    off_peak_dates: Annotated[tuple[CalendarDate, ...], Field(min_length=1, max_length=366)] | None = None
-
-    @model_validator(mode="after")
-    def valid_dates(self) -> "OffPeakRates":
-        if self.off_peak_dates is not None:
-            if self.weekday_timezone is None or len(set(self.off_peak_dates)) != len(self.off_peak_dates):
-                raise ValueError("off_peak_dates requires unique dates and a weekday_timezone")
-            tuple(map(date.fromisoformat, self.off_peak_dates))
-        return self
-
-    def active(self, when: datetime) -> bool:
-        local: Final = when.astimezone(ZoneInfo(self.weekday_timezone or "UTC"))
-        return (
-            local.date().isoformat() in (self.off_peak_dates or ())
-            or any(in_hours(window, when) for window in self.hours_utc)
-            or any(local.isoweekday() in window.weekdays and in_hours(window.hours_utc, when) for window in self.windows)
-        )
-
-
-class Price(Rates):
-    model_config = ConfigDict(frozen=True, extra="ignore")
-    off_peak_pricing: OffPeakRates | None = None
-
-    def at(self, when: datetime) -> Rates:
-        return self.off_peak_pricing if self.off_peak_pricing and self.off_peak_pricing.active(when) else self
 
 
 def month_start(when: datetime) -> datetime:

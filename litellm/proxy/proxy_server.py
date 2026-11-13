@@ -1508,14 +1508,21 @@ def _forget_prisma_client() -> None:
 
 
 @asynccontextmanager
-async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[ProxyLifespanState, None]:
+async def proxy_startup_event(
+    app: FastAPI, *, register_spend_callbacks: bool = True
+) -> AsyncGenerator[ProxyLifespanState, None]:
     with GracefulShutdownManager.capture_sigterm():
-        async with AsyncExitStack() as resources, _proxy_lifespan(app, resources) as state:
+        async with (
+            AsyncExitStack() as resources,
+            _proxy_lifespan(app, resources, register_spend_callbacks=register_spend_callbacks) as state,
+        ):
             yield state
 
 
 @asynccontextmanager
-async def _proxy_lifespan(app: FastAPI, resources: AsyncExitStack) -> AsyncGenerator[ProxyLifespanState, None]:
+async def _proxy_lifespan(
+    app: FastAPI, resources: AsyncExitStack, *, register_spend_callbacks: bool = True
+) -> AsyncGenerator[ProxyLifespanState, None]:
     global \
         prisma_client, \
         master_key, \
@@ -1720,6 +1727,7 @@ async def _proxy_lifespan(app: FastAPI, resources: AsyncExitStack) -> AsyncGener
         llm_router=llm_router,
         proxy_logging_obj=proxy_logging_obj,
         redis_usage_cache=transaction_buffer_redis_cache,
+        register_spend_callbacks=register_spend_callbacks,
     )
 
     ## V2 OTEL: publish the chosen V2 logger's TracerProvider as the OTel global.
@@ -10932,10 +10940,12 @@ class ProxyStartupEvent:
         llm_router: Router | None,
         proxy_logging_obj: ProxyLogging,
         redis_usage_cache: RedisCache | None,
+        *,
+        register_spend_callbacks: bool = True,
     ):
         """Initialize logging and alerting on startup"""
-        ## COST TRACKING ##
-        cost_tracking()
+        if register_spend_callbacks:
+            cost_tracking()
 
         proxy_logging_obj.startup_event(llm_router=llm_router, redis_usage_cache=redis_usage_cache)
 

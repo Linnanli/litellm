@@ -3,6 +3,7 @@
 import ast
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Final
 
@@ -20,7 +21,9 @@ def core_paths() -> tuple[Path, ...]:
 
 
 def forbidden(module: str) -> bool:
-    return module.partition(".")[0] in {"enterprise", "litellm_enterprise"} or module.startswith("litellm.proxy.enterprise")
+    return module.partition(".")[0] in {"enterprise", "litellm_enterprise"} or module.startswith(
+        "litellm.proxy.enterprise"
+    )
 
 
 def imports(node: ast.AST) -> tuple[str, ...]:
@@ -42,16 +45,31 @@ def main(args: tuple[str, ...]) -> int:
     if args == ("--core-paths",):
         sys.stdout.write("".join(f"{path}\n" for path in core_paths()))
         return 0
-    paths: Final = (*Path("daswork_enterprise").rglob("*.py"), *core_paths())
-    violations: Final = tuple(path for path in paths if any(map(forbidden, all_imports(path))))
+    package: Final = Path("daswork_enterprise")
+    paths: Final = (*package.glob("*.py"), *(package / "tests").rglob("*.py"))
+    violations: Final = (
+        *(path for path in paths if prohibited_imports(path.read_text(encoding="utf-8"), path)),
+        *(path for path in core_paths() if has_new_prohibited_imports(path)),
+    )
     for path in violations:
         sys.stderr.write(f"{path}: prohibited proprietary import\n")
     return int(bool(violations))
 
 
-def all_imports(path: Path) -> tuple[str, ...]:
-    nodes: Final = ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
-    return sum(map(imports, nodes), ())
+def prohibited_imports(source: str, path: Path) -> Counter[str]:
+    nodes: Final = ast.walk(ast.parse(source, filename=str(path)))
+    return Counter(module for node in nodes for module in imports(node) if forbidden(module))
+
+
+def has_new_prohibited_imports(path: Path) -> bool:
+    prior: Final = subprocess.run(
+        ["git", "show", f"{BASE}:{path.as_posix()}"],
+        capture_output=True,
+        text=True,
+    )
+    current: Final = prohibited_imports(path.read_text(encoding="utf-8"), path)
+    baseline: Final = prohibited_imports(prior.stdout, path) if prior.returncode == 0 else Counter[str]()
+    return bool(current - baseline)
 
 
 if __name__ == "__main__":

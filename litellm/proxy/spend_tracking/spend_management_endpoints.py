@@ -2713,7 +2713,18 @@ async def ui_view_spend_logs(
                         return datetime.strptime(date_str, fmt).replace(tzinfo=timezone.utc)
                     except ValueError:
                         continue
-                expected: Final = "'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'" if is_v2 else "'YYYY-MM-DD HH:MM:SS'"
+                if is_v2 and "T" in date_str:
+                    try:
+                        instant: Final = datetime.fromisoformat(date_str)
+                        if instant.utcoffset() is not None:
+                            return instant.astimezone(timezone.utc)
+                    except ValueError:
+                        pass
+                expected: Final = (
+                    "YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, or an ISO 8601 timestamp with an offset"
+                    if is_v2
+                    else "YYYY-MM-DD HH:MM:SS"
+                )
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid date format: {date_str}. Expected: {expected}",

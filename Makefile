@@ -365,14 +365,14 @@ check-daswork:
 	$(DASWORK_RUN) ruff check daswork_enterprise scripts/check_daswork_imports.py
 	$(DASWORK_RUN) ruff check --config ruff-strict.toml daswork_enterprise
 	$(DASWORK_RUN) ruff check --config ruff-tests.toml daswork_enterprise/tests
-	$(DASWORK_RUN) basedpyright --project pyrightconfig.daswork.json
+	$(DASWORK_RUN) basedpyright --project pyrightconfig.daswork.json --pythonpath .venv/bin/python
 	$(DASWORK_RUN) python scripts/check_daswork_imports.py
 	$(DASWORK_RUN) python scripts/check_type_discipline.py daswork_enterprise
 	$(DASWORK_RUN) python scripts/check_test_quality.py daswork_enterprise/tests
 	@changed=$$($(DASWORK_RUN) python scripts/check_daswork_imports.py --core-paths) && \
 	if [ -n "$$changed" ]; then \
 		$(DASWORK_RUN) ruff format --check $$changed && $(DASWORK_RUN) ruff check $$changed && \
-		$(DASWORK_RUN) basedpyright --project pyrightconfig.daswork.json $$changed; \
+		$(DASWORK_RUN) basedpyright --project pyrightconfig.daswork.json --pythonpath .venv/bin/python $$changed; \
 	fi
 
-DASWORK_RUN ?= uv run --project daswork_enterprise --frozen
+DASWORK_RUN ?= uv run --frozen --extra proxy --extra extra_proxy --extra proxy-runtime

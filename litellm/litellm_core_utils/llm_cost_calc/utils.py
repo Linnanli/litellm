@@ -558,13 +558,18 @@ def _is_off_peak(off_peak: Mapping[str, object], current_time: datetime | None =
     reference_utc: Final = (
         reference.astimezone(timezone.utc) if reference.tzinfo is not None else reference.replace(tzinfo=timezone.utc)
     )
+    weekday_timezone: Final = off_peak.get("weekday_timezone")
+    dates: Final = off_peak.get("off_peak_dates")
+    if isinstance(dates, Sequence) and not isinstance(dates, str):
+        local_date: Final = reference_utc.astimezone(_weekday_calendar(weekday_timezone)).date()
+        if local_date.isoformat() in dates:
+            return True
     flat_windows: Final = _as_window_strings(off_peak.get("hours_utc"))
     if flat_windows and _is_within_off_peak_window(flat_windows, reference_utc):
         return True
     windows: Final = off_peak.get("windows")
     if isinstance(windows, str) or not isinstance(windows, Sequence):
         return False
-    weekday_timezone: Final = off_peak.get("weekday_timezone")
     for rule in windows:
         if not isinstance(rule, Mapping):
             continue

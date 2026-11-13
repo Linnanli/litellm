@@ -321,7 +321,7 @@ build-backend = "maturin"
 manifest-path = "litellm-rust/crates/python-bridge/Cargo.toml"
 module-name = "litellm.rust_bridge._native"
 python-source = "."
-python-packages = ["litellm_cli"]
+python-packages = ["litellm_cli", "daswork_enterprise"]
 bindings = "pyo3"
 features = ["extension-module"]
 profile = "release"
@@ -334,9 +334,13 @@ include = [
     "litellm/proxy/public_endpoints/whats_new.json",
     "litellm/proxy/common_utils/codex_base_instructions.md",
     "litellm/proxy/common_utils/codex_bundled_models_0.159.3.json",
+    { path = "daswork_enterprise/schema.sql", format = "wheel" },
     { path = "model_prices_and_context_window.json", format = "sdist" },
 ]
 exclude = [
+    "daswork_enterprise/.venv/**",
+    "daswork_enterprise/tests/**",
+    "daswork_enterprise/Dockerfile",
     "litellm/proxy/enterprise",
     "litellm/proxy/enterprise/**",
     "litellm/proxy/guardrails/guardrail_hooks/litellm_content_filter/guardrail_benchmarks",

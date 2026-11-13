@@ -1,12 +1,12 @@
 from collections.abc import AsyncIterator
-from decimal import Decimal
 from typing import Annotated, Final
 
 import anyio
-import litellm
 from fastapi import Request
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 from starlette.responses import JSONResponse, Response, StreamingResponse
+
+import litellm
 
 from .contracts import JsonObject, PublicError
 from .ledger import Ledger, Reservation
@@ -14,11 +14,30 @@ from .security import Admission, reject_attribution
 
 _JSON: Final = TypeAdapter(dict[str, JsonValue])
 _TERMINAL: Final = frozenset({"response.completed", "response.incomplete", "response.failed"})
-_ALLOWED: Final = frozenset({
-    "include", "instructions", "max_output_tokens", "metadata", "parallel_tool_calls", "previous_response_id",
-    "reasoning", "store", "stream", "temperature", "text", "tool_choice", "tools", "top_p", "truncation",
-    "service_tier", "safety_identifier", "prompt_cache_key", "prompt_cache_retention", "max_tool_calls",
-})
+_ALLOWED: Final = frozenset(
+    {
+        "include",
+        "instructions",
+        "max_output_tokens",
+        "metadata",
+        "parallel_tool_calls",
+        "previous_response_id",
+        "reasoning",
+        "store",
+        "stream",
+        "temperature",
+        "text",
+        "tool_choice",
+        "tools",
+        "top_p",
+        "truncation",
+        "service_tier",
+        "safety_identifier",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "max_tool_calls",
+    }
+)
 
 
 class ResponsesRequest(BaseModel):
@@ -51,9 +70,9 @@ def output_usage(event: JsonObject) -> tuple[int, int, int] | None:
     return None if usage is None else Usage.model_validate(usage).counts()
 
 
-def estimate_input(body: JsonObject) -> int:
+def estimate_input(body: JsonObject) -> str:
     material: Final = {field: body[field] for field in ("input", "instructions", "tools") if field in body}
-    return max(1, len(_JSON.dump_json(material)) // 4)
+    return _JSON.dump_json(material).decode()
 
 
 async def settled(ledger: Ledger, entry: Reservation, usage: tuple[int, int, int] | None) -> None:
@@ -85,9 +104,7 @@ async def close_stream(stream: AsyncIterator[BaseModel]) -> None:
         await closer()
 
 
-async def responses(
-    request: Request, ledger: Ledger, admission: Admission, presented: str, call_id: str
-) -> Response:
+async def responses(request: Request, ledger: Ledger, admission: Admission, presented: str, call_id: str) -> Response:
     try:
         body: Final = _JSON.validate_json(await request.body())
         data: Final = ResponsesRequest.model_validate(body)
@@ -99,18 +116,21 @@ async def responses(
     if "litellm_metadata" in body or any(name not in _ALLOWED | {"model", "input", "background"} for name in body):
         raise PublicError(400, "unsupported_responses_parameter")
     entry: Final = await ledger.reserve(
-        presented, data.model, request.url.path, call_id, estimate_input(body), data.max_output_tokens,
+        presented,
+        data.model,
+        request.url.path,
+        call_id,
+        estimate_input(body),
+        data.max_output_tokens,
     )
     try:
-        params: Final = entry.deployment.params
         options: Final = {name: body[name] for name in _ALLOWED if name in body}
-        credential: Final = params.credential()
         await admission.check(presented, call_id)
-        result: Final = await litellm.aresponses(
+        result: Final = await entry.deployment.router.aresponses(
             input=data.input,
-            model=params.model,
-            api_base=params.api_base,
-            api_key=credential,
+            model=entry.deployment.model_id,
+            disable_fallbacks=True,
+            litellm_metadata={"user_api_key_team_id": entry.binding.team_id},
             max_retries=0,
             num_retries=0,
             timeout=120,

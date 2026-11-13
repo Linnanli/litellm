@@ -73,6 +73,7 @@ from .utils import (
     CustomPricingLiteLLMParams,
     MirroredPricingParams,
     ModelResponse,
+    OffPeakPricing,
     StandardLoggingRoutingDecision,
 )
 from .utils import (
@@ -302,6 +303,7 @@ class ModelInfo(MirroredPricingParams):
 
     base_model: str | None = None  # specify if the base model is azure/gpt-3.5-turbo etc for accurate cost tracking
     pricing_provider: str | None = None  # provider whose cost-map rows price this deployment, else custom_llm_provider
+    off_peak_pricing: OffPeakPricing | None = None
     tier: Literal["free", "paid"] | None = None
 
     """
@@ -359,6 +361,22 @@ class ModelInfo(MirroredPricingParams):
         elif isinstance(id, int):
             id = str(id)
         super().__init__(id=id, **params)
+
+    @field_validator("off_peak_pricing")
+    @classmethod
+    def _validate_off_peak_dates(cls, pricing: OffPeakPricing | None) -> OffPeakPricing | None:
+        if pricing is None or "off_peak_dates" not in pricing:
+            return pricing
+        dates: Final = pricing["off_peak_dates"]
+        if pricing.get("weekday_timezone") not in {"UTC", "Asia/Shanghai"}:
+            raise ValueError("off_peak_dates requires weekday_timezone UTC or Asia/Shanghai")
+        if not 1 <= len(dates) <= 366 or len(set(dates)) != len(dates):
+            raise ValueError("off_peak_dates requires 1 to 366 unique dates")
+        for day in dates:
+            if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", day) is None:
+                raise ValueError("off_peak_dates requires YYYY-MM-DD")
+            datetime.date.fromisoformat(day)
+        return pricing
 
     @model_validator(mode="after")
     def _validate_ptu_bounds(self) -> "ModelInfo":

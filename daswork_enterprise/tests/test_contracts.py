@@ -5,17 +5,21 @@ from typing import Final
 import pytest
 from pydantic import ValidationError
 
-from daswork_enterprise.contracts import Price, month_start, next_month
+from daswork_enterprise.contracts import month_start, next_month
+from daswork_enterprise.models import Deployment
+from litellm import Router
+from litellm.types.router import ModelInfo
+from litellm.types.utils import ModelInfo as PricingInfo
 
 RATES: Final = {
-    "input_cost_per_token": "0.000002",
-    "output_cost_per_token": "0.000008",
-    "cache_read_input_token_cost": "0.00000004",
+    "input_cost_per_token": 0.000002,
+    "output_cost_per_token": 0.000008,
+    "cache_read_input_token_cost": 0.00000004,
 }
 OFF_PEAK: Final = {
-    "input_cost_per_token": "0.000001",
-    "output_cost_per_token": "0.000004",
-    "cache_read_input_token_cost": "0.00000002",
+    "input_cost_per_token": 0.000001,
+    "output_cost_per_token": 0.000004,
+    "cache_read_input_token_cost": 0.00000002,
     "hours_utc": ("10:00-01:00", "04:00-06:00"),
     "windows": ({"hours_utc": "00:00-00:00", "weekdays": (6, 7)},),
     "weekday_timezone": "Asia/Shanghai",
@@ -37,9 +41,11 @@ OFF_PEAK: Final = {
     ),
 )
 def test_all_day_rates_and_existing_windows(time: str, amount: str) -> None:
-    price: Final = Price.model_validate({**RATES, "off_peak_pricing": OFF_PEAK})
+    info: Final = ModelInfo.model_validate({**RATES, "off_peak_pricing": OFF_PEAK})
+    price: Final = PricingInfo(**RATES, off_peak_pricing=info.off_peak_pricing)
+    deployment: Final = Deployment(Router(model_list=[]), "test", "test", "gpt-5.2", "openai", price)
     instant: Final = datetime.fromisoformat(f"2026-10-{time}:00:00+08:00")
-    assert price.at(instant).cost(1000, 100, 200) == Decimal(amount)
+    assert deployment.cost(1000, 100, instant, 200) == Decimal(amount)
 
 
 @pytest.mark.parametrize(
@@ -53,7 +59,7 @@ def test_all_day_rates_and_existing_windows(time: str, amount: str) -> None:
 def test_invalid_off_peak_dates(override: object) -> None:
     assert isinstance(override, dict)
     with pytest.raises(ValidationError):
-        Price.model_validate({**RATES, "off_peak_pricing": {**OFF_PEAK, **override}})  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]  # input is intentionally unvalidated
+        ModelInfo.model_validate({**RATES, "off_peak_pricing": {**OFF_PEAK, **override}})  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]  # input is intentionally unvalidated
 
 
 def test_shanghai_budget_boundary() -> None:

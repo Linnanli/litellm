@@ -304,6 +304,7 @@ class OffPeakPricing(TypedDict, total=False):
     hours_utc: ReadOnly[str | Sequence[str]]
     windows: ReadOnly[Sequence[OffPeakWindow]]
     weekday_timezone: ReadOnly[str]
+    off_peak_dates: ReadOnly[Sequence[str]]
     input_cost_per_token: ReadOnly[float]
     output_cost_per_token: ReadOnly[float]
     output_cost_per_reasoning_token: ReadOnly[float]
