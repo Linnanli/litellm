@@ -47,3 +47,19 @@ python -m pytest --import-mode=importlib -q daswork_enterprise/test_reporting.py
 绕开 LiteLLM 和仓储包的顶层初始化，替换日志入口，从审查快照加载原始常量、日期验证和 CSV
 函数。查询在 psycopg 中执行，鉴权使用注入的测试依赖。候选需在构建后的 Proxy 上复跑，并用
 原生 Prisma、Master Key、费用日志和 Java 端到端验证接线。
+
+## PostgreSQL 查询计划
+
+在本机 PostgreSQL 17 的临时表中复现原生 Prisma 的报表列、主键和六个账本索引。生成
+720,000 条合成记录，分布在 120 个组织、950 个部门和 180 个 UTC 日期。组织和部门均查询
+31 日，取第一个 Tag 页。以下为同一数据库上的单次 `EXPLAIN (ANALYZE, BUFFERS)` 对照，
+用时不含 Prisma 和 HTTP。
+
+| 查询 | 原生索引和读取行数 | 临时索引和读取行数 | 耗时对照 |
+| --- | --- | --- | --- |
+| 组织日用量 | `startTime` B-tree，124,000 行，组织过滤后 1,034 行 | `(organization_id, "startTime")` B-tree，1,034 行 | 119.2 到 14.6 ms |
+| 部门 Tag | `startTime` B-tree，124,000 行，Tag 过滤后 156 行 | `GIN (request_tags jsonb_path_ops)`，905 行，日期过滤后 156 行 | 193.4 到 3.9 ms |
+| 组织 CSV | `startTime` B-tree，124,000 行，组织过滤后 1,034 行 | `(organization_id, "startTime")` B-tree，1,034 行 | 80.8 到 7.9 ms |
+
+这两个索引分别减少其他组织和其他部门的堆访问，评估候选的实际读延迟时还需量化索引的写入成本。
+本批候选沿用原生 schema。上述索引只在临时表对照组创建。
