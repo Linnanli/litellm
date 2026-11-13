@@ -62,7 +62,7 @@ def attribution_name(name: str) -> bool:
 
 
 def reject_attribution(body: JsonObject, headers: Sequence[tuple[str, str]]) -> None:
-    metadata: Final = (body.get("metadata"), body.get("litellm_metadata"))
+    metadata: Final = (body.get("metadata"), body.get("litellm_metadata"), body.get("client_metadata"))
     if (
         any(map(attribution_name, body))
         or any(attribution_name(name) for name, _ in headers if name.startswith(("x-", "openai-")))

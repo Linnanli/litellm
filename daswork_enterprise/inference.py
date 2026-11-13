@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Mapping
 from typing import Annotated, Final
 
 import anyio
@@ -14,8 +14,9 @@ from .ledger import Ledger, Reservation
 from .security import Admission, reject_attribution
 
 _JSON: Final = TypeAdapter(dict[str, JsonValue])
+_CLIENT_METADATA: Final = TypeAdapter(Mapping[str, str] | None)
 _TERMINAL: Final = frozenset({"response.completed", "response.incomplete", "response.failed"})
-_ALLOWED: Final = frozenset(
+_PROVIDER_OPTIONS: Final = frozenset(
     {
         "include",
         "instructions",
@@ -71,9 +72,9 @@ def output_usage(event: JsonObject) -> tuple[int, int, int] | None:
     return None if usage is None else Usage.model_validate(usage).counts()
 
 
-def estimate_input(body: JsonObject) -> str:
-    material: Final = {field: body[field] for field in ("input", "instructions", "tools") if field in body}
-    return _JSON.dump_json(material).decode()
+def estimate_input(prompt: JsonValue, options: JsonObject) -> str:
+    context: Final = {field: options[field] for field in ("instructions", "tools") if field in options}
+    return _JSON.dump_json({"input": prompt, **context}).decode()
 
 
 async def settled(
@@ -114,27 +115,32 @@ async def close_stream(stream: AsyncIterator[object]) -> None:
             await result
 
 
-async def responses(request: Request, ledger: Ledger, admission: Admission, presented: str, call_id: str) -> Response:
+def parse_responses_request(raw: bytes, headers: tuple[tuple[str, str], ...]) -> tuple[ResponsesRequest, JsonObject]:
     try:
-        body: Final = _JSON.validate_json(await request.body())
+        body: Final = _JSON.validate_json(raw)
         data: Final = ResponsesRequest.model_validate(body)
+        reject_attribution(body, headers)
+        _CLIENT_METADATA.validate_python(body.get("client_metadata"), strict=True)
     except ValidationError as exc:
         raise PublicError(400, "invalid_responses_request") from exc
-    reject_attribution(body, tuple(request.headers.items()))
     if data.background:
         raise PublicError(400, "background_not_allowed")
-    if "litellm_metadata" in body or any(name not in _ALLOWED | {"model", "input", "background"} for name in body):
+    if any(name not in _PROVIDER_OPTIONS | {"model", "input", "background", "client_metadata"} for name in body):
         raise PublicError(400, "unsupported_responses_parameter")
+    return data, {name: body[name] for name in _PROVIDER_OPTIONS if name in body}
+
+
+async def responses(request: Request, ledger: Ledger, admission: Admission, presented: str, call_id: str) -> Response:
+    data, options = parse_responses_request(await request.body(), tuple(request.headers.items()))
     entry: Final = await ledger.reserve(
         presented,
         data.model,
         request.url.path,
         call_id,
-        estimate_input(body),
+        estimate_input(data.input, options),
         data.max_output_tokens,
     )
     try:
-        options: Final = {name: body[name] for name in _ALLOWED if name in body}
         await admission.check(presented, call_id)
         result: Final = await RoutingContext(entry.deployment.router).aresponses(
             input=data.input,

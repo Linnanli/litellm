@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 from os import environ
@@ -7,9 +8,10 @@ from textwrap import dedent
 from typing import Final
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
-from daswork_enterprise.contracts import month_start, next_month
+from daswork_enterprise.contracts import PublicError, month_start, next_month
+from daswork_enterprise.inference import estimate_input, parse_responses_request
 from daswork_enterprise.models import Deployment
 from litellm import Router
 from litellm.types.router import ModelInfo
@@ -29,6 +31,8 @@ OFF_PEAK: Final = {
     "weekday_timezone": "Asia/Shanghai",
     "off_peak_dates": ("2026-10-01",),
 }
+_REQUEST_JSON: Final = TypeAdapter(Mapping[str, JsonValue])
+_RESPONSES_BODY: Final = {"model": "synthetic-model", "input": "hello", "stream": True}
 
 
 @pytest.mark.parametrize(
@@ -83,6 +87,35 @@ def test_shanghai_budget_boundary() -> None:
     after: Final = datetime.fromisoformat("2026-11-30T16:00:00+00:00")
     assert next_month(before) == month_start(after) == after
     assert month_start(before) < month_start(after) < next_month(after)
+
+
+def test_client_metadata_does_not_enter_provider_options_or_budget_input() -> None:
+    baseline, baseline_options = parse_responses_request(_REQUEST_JSON.dump_json(_RESPONSES_BODY), ())
+    request, options = parse_responses_request(
+        _REQUEST_JSON.dump_json(
+            {**_RESPONSES_BODY, "client_metadata": {"x-codex-turn-metadata": '{"turn":"synthetic"}', "trace": "abc"}}
+        ),
+        (),
+    )
+    assert request == baseline
+    assert options == baseline_options == {"stream": True}
+    assert estimate_input(request.input, options) == estimate_input(baseline.input, baseline_options)
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    (
+        ({"client_metadata": {"x-litellm-team-id": "foreign-team"}}, "NATIVE_SESSION_ATTRIBUTION_INVALID"),
+        ({"client_metadata": {"tags": ["foreign-tag"]}}, "NATIVE_SESSION_ATTRIBUTION_INVALID"),
+        ({"client_metadata": {"trace": 123}}, "invalid_responses_request"),
+        ({"client_metadata": "synthetic"}, "invalid_responses_request"),
+        ({"future_option": True}, "unsupported_responses_parameter"),
+    ),
+)
+def test_responses_rejects_unsafe_metadata_and_unknown_options(fields: Mapping[str, JsonValue], message: str) -> None:
+    with pytest.raises(PublicError, match=message) as rejection:
+        parse_responses_request(_REQUEST_JSON.dump_json({**_RESPONSES_BODY, **fields}), ())
+    assert rejection.value.status == 400
 
 
 def test_empty_license_skips_remote_validation_at_startup() -> None:
