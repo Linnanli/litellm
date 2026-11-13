@@ -20,6 +20,7 @@ from .storage import Database
 
 _LOG: Final = logging.getLogger(__name__)
 _PENDING: Final = "daswork:session:uncommitted-fees:v1"
+_AOF_WAIT_MS: Final = 1500
 _UNAVAILABLE: Final = "budget_enforcement_unavailable"
 _FIND: Final = """
 WITH binding AS (
@@ -381,7 +382,7 @@ class Ledger:
             with anyio.fail_after(2):
                 async with self.redis.pipeline(transaction=False) as pipeline:
                     pipeline.hset(_PENDING, fee.call_id, fee.model_dump_json())  # pyright: ignore[reportUnknownMemberType]  # Redis stub shares its async and sync commands
-                    pipeline.execute_command("WAITAOF", 1, 0, 1000)  # pyright: ignore[reportUnknownMemberType]  # queued on the same connection as HSET
+                    pipeline.execute_command("WAITAOF", 1, 0, _AOF_WAIT_MS)  # pyright: ignore[reportUnknownMemberType]  # queued on the same connection as HSET
                     _, (local, _) = _AOF_ACK.validate_python(await pipeline.execute())  # pyright: ignore[reportUnknownMemberType]  # Redis stub lacks its response type
                     return local == 1
         except (RedisError, ValidationError, TimeoutError) as exc:
