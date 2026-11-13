@@ -1,6 +1,6 @@
 FROM public.ecr.aws/docker/library/rust:1.98.0-slim-bookworm@sha256:1469a27c125cb5a3aebfa4f4e4665d935b02fb72cc093b2c974b3d740e43f157 AS rust
 FROM public.ecr.aws/docker/library/node:22.23.0-bookworm-slim@sha256:d9f850096136edbc402debdd8729579a288aac64574ada0ff4db26b6ae58b0b2 AS node
-FROM public.ecr.aws/docker/library/python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2 AS build
+FROM public.ecr.aws/docker/library/python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2 AS cargo-deps
 
 WORKDIR /app
 ENV PATH="/app/.venv/bin:/opt/cargo/bin:${PATH}" \
@@ -28,21 +28,32 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --no-install-workspace --no-default-groups \
     --extra proxy --extra extra_proxy --extra proxy-runtime
 
+COPY .cargo .cargo
+COPY rust-toolchain.toml ./
+COPY litellm-rust litellm-rust
+RUN --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
+    cargo fetch --locked --manifest-path litellm-rust/Cargo.toml \
+    --target "$(rustc -vV | sed -n 's/^host: //p')"
+
+FROM cargo-deps AS build
 COPY LICENSE LICENSE
 COPY LICENSES LICENSES
 COPY README.md README.md
-COPY .cargo .cargo
-COPY rust-toolchain.toml model_prices_and_context_window.json schema.prisma ./
+COPY model_prices_and_context_window.json schema.prisma ./
 COPY litellm litellm
 COPY litellm_cli litellm_cli
-COPY litellm-rust litellm-rust
 COPY litellm-proxy-extras litellm-proxy-extras
 COPY daswork_enterprise daswork_enterprise
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=cache,target=/opt/cargo/registry \
-    --mount=type=cache,target=/app/litellm-rust/target \
-    uv sync --frozen --no-default-groups --no-editable \
+    uv sync --frozen --no-default-groups --no-editable --no-install-project \
     --extra proxy --extra extra_proxy --extra proxy-runtime
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/opt/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/app/litellm-rust/target,sharing=locked \
+    uvx --from maturin==1.15.0 maturin build --locked --release \
+    --interpreter /app/.venv/bin/python --out /tmp/litellm-wheel \
+    && uv pip install --no-deps /tmp/litellm-wheel/*.whl \
+    && rm -r /tmp/litellm-wheel
 
 RUN prisma generate --schema=/app/schema.prisma \
     && npm install --prefix /opt/prisma/schema-tool --no-audit --no-fund prisma@6.19.0 \
