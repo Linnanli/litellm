@@ -1,0 +1,7 @@
+{
+    "extends": "./pyrightconfig.json",
+    "include": ["daswork_enterprise"],
+    "exclude": ["daswork_enterprise/.venv", "**/__pycache__"],
+    "pythonVersion": "3.12",
+    "reportMissingImports": "error"
+}
