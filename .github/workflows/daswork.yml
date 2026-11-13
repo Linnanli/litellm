@@ -28,7 +28,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.23.0'
-      - run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Install isolated Rust toolchain
+        run: |
+          RUSTUP_HOME="$(mktemp -d "$RUNNER_TEMP/daswork-rustup.XXXXXX")"
+          export RUSTUP_HOME
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt,clippy --no-self-update
+          printf 'RUSTUP_HOME=%s\n' "$RUSTUP_HOME" >> "$GITHUB_ENV"
       - run: python -m pip install uv==0.11.7
       # Use the same lock as the image without resolving unselected workspace groups.
       - run: uv sync --frozen --extra proxy --extra extra_proxy --extra proxy-runtime
