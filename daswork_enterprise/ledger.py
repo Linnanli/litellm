@@ -180,10 +180,11 @@ class Ledger:
         try:
             with anyio.fail_after(3):
                 while True:
+                    # A fee can finish during PING without invalidating a later SQL snapshot.
+                    redis_ok = await self.check_coordination()
                     revision = self.revision
                     now = self.clock()
                     binding = await self.lookup(presented, model, path, now)
-                    redis_ok = await self.check_coordination()
                     if self.revision == revision:
                         return self.hold(binding, model, call_id, request, completion, now, redis_ok)
         except (PrismaError, ValidationError, TimeoutError) as exc:
