@@ -1,7 +1,8 @@
 import asyncio
+import json
 import logging
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -9,11 +10,13 @@ from typing import Final
 
 import anyio
 from anyio.abc import TaskStatus
+from anyio.lowlevel import checkpoint_if_cancelled
 from prisma.errors import PrismaError
 from pydantic import AwareDatetime, TypeAdapter, ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from .batching import Batcher
 from .contracts import Contract, Money, PublicError, SessionMetadata, month_start
 from .models import Deployment, resolve_deployment
 from .storage import Database
@@ -22,52 +25,73 @@ _LOG: Final = logging.getLogger(__name__)
 _PENDING: Final = "daswork:session:uncommitted-fees:v1"
 _AOF_WAIT_MS: Final = 1500
 _UNAVAILABLE: Final = "budget_enforcement_unavailable"
+_BATCH_SIZE: Final = 16
+_BATCH_DELAY: Final = 0.006
 _FIND: Final = """
-WITH binding AS (
+WITH requests AS (
+ SELECT DISTINCT token,window_start FROM jsonb_to_recordset($1::text::jsonb) AS item(token text,window_start text)
+), binding AS (
  SELECT k.token,k.expires,k.blocked,k.allowed_routes,k.organization_id,k.user_id,k.team_id,k.metadata,
-        o.budget_id,t.blocked AS team_blocked,t.models,u.max_budget,m.daswork_allowed_models
- FROM "LiteLLM_VerificationToken" k
+        o.budget_id,t.blocked AS team_blocked,t.models,u.max_budget,m.daswork_allowed_models,r.window_start
+ FROM requests r JOIN "LiteLLM_VerificationToken" k ON k.token=r.token
  JOIN "LiteLLM_OrganizationTable" o ON o.organization_id=k.organization_id
  JOIN "LiteLLM_UserTable" u ON u.user_id=k.user_id AND u.organization_id=k.organization_id
  JOIN "LiteLLM_TeamTable" t ON t.team_id=k.team_id AND t.organization_id=k.organization_id
  LEFT JOIN "LiteLLM_TeamMembership" m ON m.team_id=k.team_id AND m.user_id=k.user_id
- WHERE k.token=$1 AND k.metadata->>'dw_contract'='LITELLM_SESSION_V1'
+ WHERE k.metadata->>'dw_contract'='LITELLM_SESSION_V1'
 ), limits AS (
- SELECT 'organization' AS kind,a.organization_id AS identity,b.max_budget
+ SELECT a.token,a.window_start,'organization' AS kind,a.organization_id AS identity,b.max_budget
  FROM binding a JOIN "LiteLLM_BudgetTable" b ON b.budget_id=a.budget_id
- UNION ALL SELECT 'user',user_id,max_budget FROM binding
- UNION ALL SELECT 'tag',t.tag_name,b.max_budget FROM binding a
+ UNION ALL SELECT token,window_start,'user',user_id,max_budget FROM binding
+ UNION ALL SELECT a.token,a.window_start,'tag',t.tag_name,b.max_budget FROM binding a
  JOIN "LiteLLM_TagTable" t ON (a.metadata->'tags') ? t.tag_name AND t.daswork_organization_id=a.organization_id
  JOIN "LiteLLM_BudgetTable" b ON b.budget_id=t.budget_id
 )
-SELECT a.token,to_jsonb(a.expires AT TIME ZONE 'UTC') AS expires,a.blocked,a.allowed_routes,a.organization_id,a.user_id,a.team_id,a.metadata,
+SELECT a.token,a.window_start,to_jsonb(a.expires AT TIME ZONE 'UTC') AS expires,a.blocked,a.allowed_routes,a.organization_id,a.user_id,a.team_id,a.metadata,
        a.team_blocked,a.models,a.daswork_allowed_models,
        (SELECT jsonb_agg(jsonb_build_object('kind',l.kind,'identity',l.identity,
           'maximum',l.max_budget::text,'spend',COALESCE(w.spend,0)::text))
         FROM limits l LEFT JOIN "LiteLLM_BudgetWindowSpend" w ON w.entity_type=l.kind AND w.entity_id=l.identity
-        AND w.window_duration='1mo' AND w.window_start=($2::text::timestamptz AT TIME ZONE 'UTC')) AS limits,
-       CASE WHEN cardinality($3::text[]) > 0 THEN ARRAY(
-           SELECT request_id FROM "LiteLLM_SpendLogs" WHERE request_id=ANY($3::text[])
+        AND w.window_duration='1mo' AND w.window_start=(a.window_start::timestamptz AT TIME ZONE 'UTC')
+        WHERE l.token=a.token AND l.window_start=a.window_start) AS limits,
+       CASE WHEN cardinality($2::text[]) > 0 THEN ARRAY(
+           SELECT request_id FROM "LiteLLM_SpendLogs" WHERE request_id=ANY($2::text[])
        ) ELSE ARRAY[]::text[] END AS settled
 FROM binding a
 """
 _SETTLE: Final = """
-WITH new_fee AS (
+WITH fees AS (
+ SELECT * FROM jsonb_to_recordset($1::text::jsonb) AS fee(
+  call_id text, token text, started timestamptz, ended timestamptz, amount double precision,
+  prompt int, completion int, organization_id text, user_id text, team_id text, tags jsonb,
+  model text, model_id text, window_start timestamptz, provider text, duration_ms int, status text, cached int
+ )
+), new_fee AS (
  INSERT INTO "LiteLLM_SpendLogs"(request_id,litellm_call_id,call_type,api_key,"startTime","endTime",spend,prompt_tokens,
  completion_tokens,total_tokens,organization_id,"user",team_id,request_tags,model,model_id,model_group,
  custom_llm_provider,request_duration_ms,status,metadata)
- VALUES ($1,$1,'aresponses',$2,($3::text::timestamptz AT TIME ZONE 'UTC'),($4::text::timestamptz AT TIME ZONE 'UTC'),$5::text::float8,$6::int,$7::int,
- $6::int + $7::int,$8,$9,$10,to_jsonb($11::text[]),$12,$13,$12,$15,$16,$17,
- jsonb_build_object('status',$17::text,'usage_object',jsonb_build_object(
- 'prompt_tokens',$6::int,'completion_tokens',$7::int,'total_tokens',$6::int + $7::int,
- 'prompt_tokens_details',jsonb_build_object('cached_tokens',$18::int))))
+ SELECT call_id,call_id,'aresponses',token,started AT TIME ZONE 'UTC',ended AT TIME ZONE 'UTC',
+ amount,prompt,completion,prompt+completion,organization_id,user_id,team_id,tags,model,model_id,model,provider,duration_ms,status,
+ jsonb_build_object('status',status,'usage_object',jsonb_build_object(
+ 'prompt_tokens',prompt,'completion_tokens',completion,'total_tokens',prompt+completion,
+ 'prompt_tokens_details',jsonb_build_object('cached_tokens',cached)))
+ FROM fees ORDER BY call_id
  ON CONFLICT DO NOTHING RETURNING request_id
 ), entities AS (
- SELECT 'organization' AS kind,$8::text AS identity UNION ALL SELECT 'user',$9
- UNION ALL SELECT 'tag',unnest($11::text[])
+ SELECT scope.kind,scope.identity,fee.window_start,fee.amount
+ FROM fees fee JOIN new_fee n ON n.request_id=fee.call_id
+ CROSS JOIN LATERAL (
+  SELECT 'organization' AS kind,fee.organization_id AS identity UNION ALL SELECT 'user',fee.user_id
+  UNION ALL SELECT 'tag',jsonb_array_elements_text(fee.tags)
+ ) AS scope
+), windows AS (
+ SELECT kind,identity,window_start,SUM(amount) AS spend FROM entities GROUP BY kind,identity,window_start
+), latest AS (
+ SELECT DISTINCT ON (kind,identity) kind,identity,window_start,spend
+ FROM windows ORDER BY kind,identity,window_start DESC
 )
 INSERT INTO "LiteLLM_BudgetWindowSpend" AS balance(entity_type,entity_id,window_duration,window_start,spend,updated_at)
-SELECT kind,identity,'1mo',($14::text::timestamptz AT TIME ZONE 'UTC'),$5::text::float8,now() FROM entities CROSS JOIN new_fee ORDER BY kind,identity
+SELECT kind,identity,'1mo',window_start AT TIME ZONE 'UTC',spend,now() FROM latest ORDER BY kind,identity
 ON CONFLICT(entity_type,entity_id,window_duration) DO UPDATE SET
  window_start=EXCLUDED.window_start,spend=CASE WHEN balance.window_start=EXCLUDED.window_start
  THEN balance.spend + EXCLUDED.spend ELSE EXCLUDED.spend END,updated_at=now()
@@ -89,6 +113,7 @@ class Limit(Contract):
 
 class Binding(Contract):
     token: str
+    window_start: str
     expires: AwareDatetime
     blocked: bool
     allowed_routes: tuple[str, ...]
@@ -132,6 +157,13 @@ class Fee(Contract):
     cached: int
 
 
+@dataclass(frozen=True, slots=True)
+class BudgetSnapshot:
+    revision: int
+    bindings: Mapping[tuple[str, str], Binding | ValidationError]
+
+
+_BINDING_KEY: Final = TypeAdapter(tuple[str, str])
 _PENDING_VALUES: Final = TypeAdapter(dict[str, bytes])
 _AOF_ACK: Final = TypeAdapter(tuple[object, tuple[int, int]])
 
@@ -149,13 +181,28 @@ class Ledger:
         self.wake: Final = asyncio.Event()
         self.ready = False
         self.revision = 0
+        self.reads: Final = Batcher(self.read_budgets, _BATCH_DELAY, _BATCH_SIZE)
+        self.writes: Final = Batcher(self.commit, _BATCH_DELAY, _BATCH_SIZE)
 
-    async def lookup(self, presented: str, model: str, path: str, now: datetime) -> Binding:
-        try:
-            row: Final = await self.db.one(_FIND, (presented, month_start(now).isoformat(), list(self.undelivered)))
-        except PublicError as exc:
-            raise PublicError(401, "token_not_found_in_db") from exc
-        binding: Final = Binding.model_validate(row)
+    async def read_budgets(self, requests: tuple[tuple[str, str], ...]) -> BudgetSnapshot:
+        revision: Final = self.revision
+        params: Final = json.dumps(tuple({"token": token, "window_start": window} for token, window in requests))
+        with anyio.fail_after(2):
+            rows: Final = await self.db.rows(_FIND, (params, list(self.undelivered)))
+        bindings: Final = dict[tuple[str, str], Binding | ValidationError]()
+        for row in rows:
+            key = _BINDING_KEY.validate_python((row.get("token"), row.get("window_start")))
+            try:
+                bindings[key] = Binding.model_validate(row)
+            except ValidationError as exc:
+                bindings[key] = exc
+        return BudgetSnapshot(revision, bindings)
+
+    def check_binding(self, binding: Binding | ValidationError | None, model: str, path: str, now: datetime) -> Binding:
+        if isinstance(binding, ValidationError):
+            raise binding
+        if binding is None:
+            raise PublicError(401, "token_not_found_in_db")
         if binding.expires <= now:
             raise PublicError(401, "token_expired")
         if binding.blocked or binding.team_blocked or path not in binding.allowed_routes:
@@ -180,12 +227,13 @@ class Ledger:
         try:
             with anyio.fail_after(3):
                 while True:
-                    # A fee can finish during PING without invalidating a later SQL snapshot.
                     redis_ok = await self.check_coordination()
-                    revision = self.revision
+                    key = (presented, month_start(self.clock()).isoformat())
+                    snapshot = await self.reads.submit(key)
+                    await checkpoint_if_cancelled()
                     now = self.clock()
-                    binding = await self.lookup(presented, model, path, now)
-                    if self.revision == revision:
+                    if self.revision == snapshot.revision and key[1] == month_start(now).isoformat():
+                        binding = self.check_binding(snapshot.bindings.get(key), model, path, now)
                         return self.hold(binding, model, call_id, request, completion, now, redis_ok)
         except (PrismaError, ValidationError, TimeoutError) as exc:
             _LOG.warning("checkpoint=admission call=%s category=%s", call_id, type(exc).__name__)
@@ -260,38 +308,42 @@ class Ledger:
 
     def note_fee(self, fee: Fee) -> None:
         self.undelivered[fee.call_id] = fee
-        self.revision += 1
 
     def clear_fee(self, call_id: str) -> None:
         self.undelivered.pop(call_id, None)
         self.retryable.discard(call_id)
         self.volatile.discard(call_id)
+
+    async def commit(self, fees: tuple[Fee, ...]) -> None:
+        unique: Final = dict[str, Fee]()
+        for fee in fees:
+            unique.setdefault(fee.call_id, fee)
+        values: Final = json.dumps(
+            tuple(
+                {**fee.model_dump(mode="json"), "window_start": month_start(fee.ended).isoformat()}
+                for fee in unique.values()
+            )
+        )
+        # Invalidate reads across a write's start or confirmed completion.
+        self.revision += 1
+        with anyio.fail_after(2):
+            await self.db.rows(_SETTLE, (values,))
+        for call_id in unique:
+            self.clear_fee(call_id)
         self.revision += 1
 
-    async def commit(self, fee: Fee) -> None:
-        await self.db.rows(
-            _SETTLE,
-            (
-                fee.call_id,
-                fee.token,
-                fee.started.isoformat(),
-                fee.ended.isoformat(),
-                str(fee.amount),
-                fee.prompt,
-                fee.completion,
-                fee.organization_id,
-                fee.user_id,
-                fee.team_id,
-                list(fee.tags),
-                fee.model,
-                fee.model_id,
-                month_start(fee.ended).isoformat(),
-                fee.provider,
-                fee.duration_ms,
-                fee.status,
-                fee.cached,
-            ),
-        )
+    async def replay(self, identities: tuple[str, ...]) -> None:
+        fees: Final = tuple(self.undelivered[identity] for identity in identities)
+        await self.commit(fees)
+        try:
+            await self.remove_pending(identities)
+        except (RedisError, TimeoutError) as exc:
+            _LOG.warning(
+                "checkpoint=journal_cleanup call=%s count=%d category=%s",
+                identities[0],
+                len(identities),
+                type(exc).__name__,
+            )
 
     async def recover(self) -> None:
         if not self.ready:
@@ -303,17 +355,12 @@ class Ledger:
                 fee = Fee.model_validate_json(value)
                 self.note_fee(fee)
                 self.retryable.add(fee.call_id)
+            self.revision += 1
             self.ready = True
 
-        for identity in tuple(self.retryable):
-            fee = self.undelivered[identity]
-            with anyio.fail_after(2):
-                await self.commit(fee)
-            self.clear_fee(identity)
-            try:
-                await self.remove_pending(identity)
-            except (RedisError, TimeoutError) as exc:
-                _LOG.warning("checkpoint=journal_cleanup call=%s category=%s", identity, type(exc).__name__)
+        identities: Final = tuple(self.retryable)
+        for offset in range(0, len(identities), _BATCH_SIZE):
+            await self.replay(identities[offset : offset + _BATCH_SIZE])
 
     async def recovery_worker(self, *, task_status: TaskStatus[None]) -> None:
         try:
@@ -358,25 +405,23 @@ class Ledger:
             cached=cached,
         )
         self.note_fee(fee)
-        try:
-            with anyio.fail_after(2):
-                await self.commit(fee)
-        except (PrismaError, TimeoutError) as exc:
-            durable: Final = await self.save_pending(fee)
-            self.retryable.add(fee.call_id)
-            self.wake.set()
-            _LOG.warning(
-                "checkpoint=settlement call=%s category=%s durable=%s", fee.call_id, type(exc).__name__, durable
-            )
-            if not durable:
-                self.volatile.add(fee.call_id)
-                raise PublicError(503, _UNAVAILABLE) from exc
-            return
-        self.clear_fee(fee.call_id)
+        with anyio.CancelScope(shield=True):
+            try:
+                await self.writes.submit(fee)
+            except (PrismaError, TimeoutError) as exc:
+                durable: Final = await self.save_pending(fee)
+                self.retryable.add(fee.call_id)
+                self.wake.set()
+                _LOG.warning(
+                    "checkpoint=settlement call=%s category=%s durable=%s", fee.call_id, type(exc).__name__, durable
+                )
+                if not durable:
+                    self.volatile.add(fee.call_id)
+                    raise PublicError(503, _UNAVAILABLE) from exc
 
-    async def remove_pending(self, call_id: str) -> None:
+    async def remove_pending(self, identities: tuple[str, ...]) -> None:
         with anyio.fail_after(2):
-            await self.redis.hdel(_PENDING, call_id)  # pyright: ignore[reportGeneralTypeIssues, reportUnknownMemberType]  # Redis unions sync and async
+            await self.redis.hdel(_PENDING, *identities)  # pyright: ignore[reportGeneralTypeIssues, reportUnknownMemberType]  # Redis unions sync and async
 
     async def save_pending(self, fee: Fee) -> bool:
         try:
