@@ -565,7 +565,7 @@ async def test_replay_batches_persisted_duplicate_and_mixed_months(monkeypatch: 
         await ledger.commit((persisted, persisted))
         try:
             await redis.hset(  # pyright: ignore[reportGeneralTypeIssues, reportUnknownMemberType]  # Redis stub shares async and sync commands
-                pending, mapping={fee.call_id: fee.model_dump_json() for fee in entries}
+                pending, mapping={fee.call_id: fee.model_dump_json(exclude_none=True) for fee in entries}
             )
             await ledger.recover()
             await ledger.recover()
@@ -633,8 +633,8 @@ async def test_recovery_retries_redis_cleanup_after_postgres_commits(monkeypatch
         await connection.execute(_SETTLEMENT_TABLES)
         database: Final = SettlementDatabase(connection)
         ledger: Final = InterruptedCleanup(database, redis, lambda: _NOW)  # pyright: ignore[reportArgumentType]  # the Redis stub is invariant
-        assert await ledger.save_pending(fee)
         try:
+            await redis.hset(pending, fee.call_id, fee.model_dump_json())  # pyright: ignore[reportGeneralTypeIssues, reportUnknownMemberType]  # Redis stub shares async and sync commands
             with anyio.fail_after(5):
                 async with anyio.create_task_group() as tasks:
                     await tasks.start(ledger.recovery_worker)
