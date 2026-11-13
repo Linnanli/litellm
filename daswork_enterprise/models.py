@@ -3,13 +3,25 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Final
 
+from pydantic import BaseModel, ConfigDict, TypeAdapter
+
 from litellm import Router
 from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
 from litellm.litellm_core_utils.llm_cost_calc.utils import generic_cost_per_token
 from litellm.types.utils import ModelInfo, PromptTokensDetailsWrapper, Usage
-from litellm.utils import token_counter
+from litellm.utils import (
+    token_counter,  # pyright: ignore[reportUnknownVariableType]  # only the typed text/count interface is used
+)
 
 from .contracts import PublicError
+
+
+class CandidateIdentity(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    id: str | None = None
+
+
+_CANDIDATE: Final[TypeAdapter[CandidateIdentity | None]] = TypeAdapter(CandidateIdentity | None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,23 +64,23 @@ def resolve_deployment(organization_id: str, team_id: str, model: str) -> Deploy
     registry: Final = router.registry()
     candidates: Final = registry.deployments(model, source="all", team_id=team_id)
     for candidate in candidates:
-        identity = candidate.get("model_info", {}).get("id")
-        if not isinstance(identity, str):
+        identity = _CANDIDATE.validate_python(candidate.get("model_info"))  # pyright: ignore[reportUnknownMemberType]  # legacy router dictionary is validated here
+        if identity is None or identity.id is None:
             continue
-        deployment = registry.deployment(identity)
+        deployment = registry.deployment(identity.id)
         if deployment is None or deployment.blocked or deployment.model_info.blocked:
             continue
         info = deployment.model_info
-        owner = info.get("organization_id")
+        owner = info.organization_id
         if owner is not None and owner != organization_id or info.team_id not in {None, team_id}:
             continue
         provider_model, provider, _, _ = get_llm_provider(
             deployment.litellm_params.model, litellm_params=deployment.litellm_params
         )
-        price = registry.deployment_model_info(identity, deployment.litellm_params.model)
+        price = registry.deployment_model_info(identity.id, deployment.litellm_params.model)
         if price is None:
             raise PublicError(503, "model_pricing_unavailable")
-        return Deployment(router, identity, model, provider_model, provider, price)
+        return Deployment(router, identity.id, model, provider_model, provider, price)
     if candidates or registry.deployments(model, source="named"):
         raise PublicError(403, "model_not_allowed")
     raise PublicError(404, "model_not_found")

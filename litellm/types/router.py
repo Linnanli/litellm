@@ -311,6 +311,7 @@ class ModelInfo(MirroredPricingParams):
     """
     # the team id that this model belongs to
     team_id: str | None = None
+    organization_id: str | None = None
 
     # the model_name that can be used by the team when making LLM calls
     team_public_model_name: str | None = None

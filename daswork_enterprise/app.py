@@ -7,6 +7,7 @@ from os import environ
 from typing import Annotated, Final, TypeAlias
 from uuid import uuid4
 
+import anyio
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -73,12 +74,18 @@ def gateway_lifespan(
             if not isinstance(redis, Redis):
                 raise TypeError("Daswork requires standalone coordination Redis")
             db: Final = Database(writer.prisma.writer_db)
-            yield {
-                **native,
-                "subjects": Subjects(db, clock),
-                "ledger": Ledger(db, redis, clock),
-                "admission": Admission(hook, config.admission_endpoint),
-            }
+            ledger: Final = Ledger(db, redis, clock)
+            async with anyio.create_task_group() as tasks:
+                await tasks.start(ledger.recovery_worker)
+                try:
+                    yield {
+                        **native,
+                        "subjects": Subjects(db, clock),
+                        "ledger": ledger,
+                        "admission": Admission(hook, config.admission_endpoint),
+                    }
+                finally:
+                    tasks.cancel_scope.cancel()
 
     return lifespan
 
@@ -280,6 +287,8 @@ _NATIVE_FIXED: Final = frozenset(
         ("GET", "/model/info"),
         ("GET", "/v1/model/info"),
         ("GET", "/utils/model_info"),
+        ("GET", "/model/cost_map/source"),
+        ("POST", "/reload/model_cost_map"),
         ("GET", "/spend/logs/v2"),
         ("GET", "/credentials"),
         ("POST", "/credentials"),
@@ -305,9 +314,11 @@ class NativeManagement:
         self.native = native
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and is_native_management(str(scope["method"]), str(scope["path"])):
-            await self.native(scope, receive, send)
-            return
+        if scope["type"] == "http":
+            request: Final = Request(scope)
+            if is_native_management(request.method, request.url.path):
+                await self.native(scope, receive, send)
+                return
         if scope["type"] == "websocket":
             await send({"type": "websocket.close", "code": 1008})
             return

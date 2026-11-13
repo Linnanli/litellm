@@ -53,6 +53,6 @@ def run_schema(initialize: bool) -> None:
             raise ValueError("schema initialization requires an empty database")
         ddl: Final = Path("/app/schema.generated.sql").read_text(encoding="utf-8")
         extension: Final = files("daswork_enterprise").joinpath("schema.sql").read_text(encoding="utf-8")
-        connection.execute(SQL(ddl), prepare=False)
-        connection.execute(SQL(extension), prepare=False)
+        connection.execute(SQL(ddl), prepare=False)  # pyright: ignore[reportArgumentType]  # image-owned generated schema
+        connection.execute(SQL(extension), prepare=False)  # pyright: ignore[reportArgumentType]  # package-owned static migration
         check_schema(connection)

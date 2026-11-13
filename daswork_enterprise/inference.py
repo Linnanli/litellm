@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from typing import Annotated, Final
 
 import anyio
@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, Valid
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 import litellm
+from litellm.router_api import RoutingContext
 
 from .contracts import JsonObject, PublicError
 from .ledger import Ledger, Reservation
@@ -75,19 +76,26 @@ def estimate_input(body: JsonObject) -> str:
     return _JSON.dump_json(material).decode()
 
 
-async def settled(ledger: Ledger, entry: Reservation, usage: tuple[int, int, int] | None) -> None:
+async def settled(
+    ledger: Ledger, entry: Reservation, usage: tuple[int, int, int] | None, status: str = "success"
+) -> None:
     with anyio.CancelScope(shield=True):
-        await ledger.finish(entry, usage)
+        await ledger.finish(entry, usage, status)
 
 
-async def events(ledger: Ledger, entry: Reservation, stream: AsyncIterator[BaseModel]) -> AsyncIterator[str]:
+async def events(ledger: Ledger, entry: Reservation, stream: AsyncIterator[object]) -> AsyncIterator[str]:
     try:
         async for event in stream:
-            wire: Final = event.model_dump_json(exclude_none=True)
-            if (data := _JSON.validate_json(wire)).get("type") in _TERMINAL:
-                response: Final = data.get("response")
+            if not isinstance(event, BaseModel):
+                raise PublicError(502, "invalid_provider_event")
+            wire = event.model_dump_json(exclude_none=True)
+            data = _JSON.validate_json(wire)
+            if (kind := data.get("type")) in _TERMINAL:
+                response = data.get("response")
                 if isinstance(response, dict):
-                    await settled(ledger, entry, output_usage(response))
+                    await settled(
+                        ledger, entry, output_usage(response), "failure" if kind == "response.failed" else "success"
+                    )
             yield f"data: {wire}\n\n"
         yield "data: [DONE]\n\n"
     finally:
@@ -98,10 +106,12 @@ async def events(ledger: Ledger, entry: Reservation, stream: AsyncIterator[BaseM
                 await ledger.finish(entry, None)
 
 
-async def close_stream(stream: AsyncIterator[BaseModel]) -> None:
-    closer: Final = getattr(stream, "aclose", None)
+async def close_stream(stream: AsyncIterator[object]) -> None:
+    closer: Final[object] = getattr(stream, "aclose", None)  # pyright: ignore[reportAny]  # iterator variants have optional close
     if callable(closer):
-        await closer()
+        result: Final = closer()
+        if isinstance(result, Awaitable):
+            await result
 
 
 async def responses(request: Request, ledger: Ledger, admission: Admission, presented: str, call_id: str) -> Response:
@@ -126,12 +136,13 @@ async def responses(request: Request, ledger: Ledger, admission: Admission, pres
     try:
         options: Final = {name: body[name] for name in _ALLOWED if name in body}
         await admission.check(presented, call_id)
-        result: Final = await entry.deployment.router.aresponses(
+        result: Final = await RoutingContext(entry.deployment.router).aresponses(
             input=data.input,
             model=entry.deployment.model_id,
             disable_fallbacks=True,
             litellm_metadata={"user_api_key_team_id": entry.binding.team_id},
             max_retries=0,
+            _skip_mcp_handler=True,
             num_retries=0,
             timeout=120,
             litellm_call_id=call_id,
@@ -140,8 +151,15 @@ async def responses(request: Request, ledger: Ledger, admission: Admission, pres
         headers: Final = {"x-litellm-call-id": call_id}
         if isinstance(result, BaseModel):
             serialized: Final = _JSON.validate_json(result.model_dump_json(exclude_none=True))
-            await settled(ledger, entry, output_usage(serialized))
+            await settled(
+                ledger,
+                entry,
+                output_usage(serialized),
+                "failure" if serialized.get("status") == "failed" else "success",
+            )
             return JSONResponse(serialized, headers=headers)
+        if not isinstance(result, AsyncIterator):
+            raise PublicError(502, "invalid_provider_response")
         return StreamingResponse(events(ledger, entry, result), media_type="text/event-stream", headers=headers)
     except (litellm.APIError, litellm.Timeout, litellm.APIConnectionError) as exc:
         await settled(ledger, entry, None)

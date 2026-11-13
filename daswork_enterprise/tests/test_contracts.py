@@ -42,7 +42,19 @@ OFF_PEAK: Final = {
 )
 def test_all_day_rates_and_existing_windows(time: str, amount: str) -> None:
     info: Final = ModelInfo.model_validate({**RATES, "off_peak_pricing": OFF_PEAK})
-    price: Final = PricingInfo(**RATES, off_peak_pricing=info.off_peak_pricing)
+    price: Final = PricingInfo(
+        key="openai/gpt-5.2",
+        max_tokens=16384,
+        max_input_tokens=16384,
+        max_output_tokens=4096,
+        mode="responses",
+        litellm_provider="openai",
+        supported_openai_params=None,
+        input_cost_per_token=RATES["input_cost_per_token"],
+        output_cost_per_token=RATES["output_cost_per_token"],
+        cache_read_input_token_cost=RATES["cache_read_input_token_cost"],
+        off_peak_pricing=info.off_peak_pricing,
+    )
     deployment: Final = Deployment(Router(model_list=[]), "test", "test", "gpt-5.2", "openai", price)
     instant: Final = datetime.fromisoformat(f"2026-10-{time}:00:00+08:00")
     assert deployment.cost(1000, 100, instant, 200) == Decimal(amount)

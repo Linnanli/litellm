@@ -1,11 +1,14 @@
 import asyncio
 import logging
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Final
 
+import anyio
+from anyio.abc import TaskStatus
 from prisma.errors import PrismaError
 from pydantic import AwareDatetime, TypeAdapter, ValidationError
 from redis.asyncio import Redis
@@ -41,7 +44,10 @@ SELECT a.token,to_jsonb(a.expires AT TIME ZONE 'UTC') AS expires,a.blocked,a.all
        (SELECT jsonb_agg(jsonb_build_object('kind',l.kind,'identity',l.identity,
           'maximum',l.max_budget::text,'spend',COALESCE(w.spend,0)::text))
         FROM limits l LEFT JOIN "LiteLLM_BudgetWindowSpend" w ON w.entity_type=l.kind AND w.entity_id=l.identity
-        AND w.window_duration='1mo' AND w.window_start=($2::text::timestamptz AT TIME ZONE 'UTC')) AS limits
+        AND w.window_duration='1mo' AND w.window_start=($2::text::timestamptz AT TIME ZONE 'UTC')) AS limits,
+       CASE WHEN cardinality($3::text[]) > 0 THEN ARRAY(
+           SELECT request_id FROM "LiteLLM_SpendLogs" WHERE request_id=ANY($3::text[])
+       ) ELSE ARRAY[]::text[] END AS settled
 FROM binding a
 """
 _SETTLE: Final = """
@@ -93,6 +99,7 @@ class Binding(Contract):
     models: tuple[str, ...]
     daswork_allowed_models: tuple[str, ...] | None
     limits: tuple[Limit, ...]
+    settled: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,10 +109,6 @@ class Reservation:
     started: datetime
     estimate: Decimal
     call_id: str
-
-    @property
-    def scopes(self) -> frozenset[tuple[str, str]]:
-        return frozenset(limit.scope for limit in self.binding.limits)
 
 
 class Fee(Contract):
@@ -137,13 +140,18 @@ class Ledger:
         self.db = db
         self.redis = redis
         self.clock = clock
-        self.gate = asyncio.Lock()
         self.active: Final = dict[str, Reservation]()
+        self.reserved: Final = defaultdict[tuple[str, str], Decimal](Decimal)
         self.undelivered: Final = dict[str, Fee]()
+        self.retryable: Final = set[str]()
+        self.volatile: Final = set[str]()
+        self.wake: Final = asyncio.Event()
+        self.ready = False
+        self.revision = 0
 
     async def lookup(self, presented: str, model: str, path: str, now: datetime) -> Binding:
         try:
-            row: Final = await self.db.one(_FIND, (presented, month_start(now).isoformat()))
+            row: Final = await self.db.one(_FIND, (presented, month_start(now).isoformat(), list(self.undelivered)))
         except PublicError as exc:
             raise PublicError(401, "token_not_found_in_db") from exc
         binding: Final = Binding.model_validate(row)
@@ -168,46 +176,78 @@ class Ledger:
         request: str,
         completion: int | None,
     ) -> Reservation:
-        async with self.gate:
-            try:
-                now: Final = self.clock()
-                binding: Final = await self.lookup(presented, model, path, now)
-            except (PrismaError, RedisError, ValidationError, TimeoutError) as exc:
-                _LOG.warning("checkpoint=admission call=%s category=%s", call_id, type(exc).__name__)
-                raise PublicError(503, _UNAVAILABLE) from exc
-            deployment: Final = resolve_deployment(binding.organization_id, binding.team_id, model)
-            estimate: Final = deployment.estimate(request, completion, now)
-            reservation: Final = Reservation(binding, deployment, now, estimate, call_id)
-            if any(self.exceeds(limit, estimate, now) for limit in binding.limits):
-                raise PublicError(422, "budget_exceeded")
-            try:
-                if await self.recover():
-                    binding_after: Final = await self.lookup(presented, model, path, now)
-                    if any(self.exceeds(limit, estimate, now) for limit in binding_after.limits):
-                        raise PublicError(422, "budget_exceeded")
-                    reservation = Reservation(binding_after, deployment, now, estimate, call_id)
-            except (PrismaError, RedisError, ValidationError, TimeoutError) as exc:
-                _LOG.warning("checkpoint=recovery_admission call=%s category=%s", call_id, type(exc).__name__)
-                raise PublicError(503, _UNAVAILABLE) from exc
-            if any(self.exceeds(limit, estimate, now) for limit in reservation.binding.limits):
-                raise PublicError(422, "budget_exceeded")
-            self.active[call_id] = reservation
-            return reservation
+        try:
+            with anyio.fail_after(3):
+                while True:
+                    revision = self.revision
+                    now = self.clock()
+                    binding = await self.lookup(presented, model, path, now)
+                    if self.revision == revision:
+                        return self.hold(binding, model, call_id, request, completion, now)
+        except (PrismaError, ValidationError, TimeoutError) as exc:
+            _LOG.warning("checkpoint=admission call=%s category=%s", call_id, type(exc).__name__)
+            raise PublicError(503, _UNAVAILABLE) from exc
 
-    def exceeds(self, limit: Limit, estimate: Decimal, now: datetime) -> bool:
-        if estimate == 0 or limit.maximum is None:
+    def hold(
+        self, binding: Binding, model: str, call_id: str, request: str, completion: int | None, now: datetime
+    ) -> Reservation:
+        # The writer may have committed a fee while its reply is in flight. The
+        # binding read records which pending IDs its spend snapshot already includes.
+        deployment: Final = resolve_deployment(binding.organization_id, binding.team_id, model)
+        estimate: Final = deployment.estimate(request, completion, now)
+        confirmed: Final = self.confirmed_spend(binding.settled, month_start(now))
+        if estimate and any(
+            limit.maximum is not None
+            and limit.spend
+            + self.reserved.get(limit.scope, Decimal(0))
+            + confirmed.get(limit.scope, Decimal(0))
+            + estimate
+            > limit.maximum
+            for limit in binding.limits
+        ):
+            raise PublicError(422, "budget_exceeded")
+        if not self.ready or self.volatile:
+            raise PublicError(503, _UNAVAILABLE)
+        reservation: Final = Reservation(binding, deployment, now, estimate, call_id)
+        self.active[call_id] = reservation
+        for limit in binding.limits:
+            self.reserved[limit.scope] += estimate
+        return reservation
+
+    def confirmed_spend(
+        self, settled: tuple[str, ...], window: datetime
+    ) -> defaultdict[tuple[str, str], Decimal]:  # mutable-ok: short-lived private accumulator
+        confirmed: Final = defaultdict[tuple[str, str], Decimal](Decimal)
+        settled_ids: Final = frozenset(settled)
+        for fee in self.undelivered.values():
+            if fee.call_id not in settled_ids and month_start(fee.ended) == window:
+                confirmed[("organization", fee.organization_id)] += fee.amount
+                confirmed[("user", fee.user_id)] += fee.amount
+                for tag in fee.tags:
+                    confirmed[("tag", tag)] += fee.amount
+        return confirmed
+
+    def release(self, call_id: str) -> bool:
+        entry: Final = self.active.pop(call_id, None)
+        if entry is None:
             return False
-        reserved: Final = sum(entry.estimate for entry in self.active.values() if limit.scope in entry.scopes)
-        confirmed: Final = sum(
-            fee.amount
-            for fee in self.undelivered.values()
-            if month_start(fee.ended) == month_start(now)
-            and (
-                limit.scope in {("organization", fee.organization_id), ("user", fee.user_id)}
-                or (limit.kind == "tag" and limit.identity in fee.tags)
-            )
-        )
-        return limit.spend + reserved + confirmed + estimate > limit.maximum
+        for limit in entry.binding.limits:
+            remainder = self.reserved[limit.scope] - entry.estimate
+            if remainder:
+                self.reserved[limit.scope] = remainder
+            else:
+                del self.reserved[limit.scope]
+        return True
+
+    def note_fee(self, fee: Fee) -> None:
+        self.undelivered[fee.call_id] = fee
+        self.revision += 1
+
+    def clear_fee(self, call_id: str) -> None:
+        self.undelivered.pop(call_id, None)
+        self.retryable.discard(call_id)
+        self.volatile.discard(call_id)
+        self.revision += 1
 
     async def commit(self, fee: Fee) -> None:
         await self.db.rows(
@@ -234,70 +274,99 @@ class Ledger:
             ),
         )
 
-    async def recover(self) -> bool:
-        payload: Final = await self.redis.execute_command("HGETALL", _PENDING)  # pyright: ignore[reportAny]  # validated below
-        pending: Final = _PENDING_VALUES.validate_python(payload)
-        fees: Final = {identity: Fee.model_validate_json(value) for identity, value in pending.items()}
-        fees.update(self.undelivered)
-        for fee in fees.values():
-            await self.commit(fee)
-            self.undelivered.pop(fee.call_id, None)
-            await self.redis.execute_command("HDEL", _PENDING, fee.call_id)
-        return bool(fees)
+    async def recover(self) -> None:
+        if not self.ready:
+            with anyio.fail_after(2):
+                pending: Final = _PENDING_VALUES.validate_python(
+                    await self.redis.hgetall(_PENDING)  # pyright: ignore[reportGeneralTypeIssues, reportUnknownMemberType]  # Redis unions sync and async; boundary validated
+                )
+            for value in pending.values():
+                fee = Fee.model_validate_json(value)
+                self.note_fee(fee)
+                self.retryable.add(fee.call_id)
+            self.ready = True
+
+        for identity in tuple(self.retryable):
+            fee = self.undelivered[identity]
+            with anyio.fail_after(2):
+                await self.commit(fee)
+            self.clear_fee(identity)
+            try:
+                await self.remove_pending(identity)
+            except (RedisError, TimeoutError) as exc:
+                _LOG.warning("checkpoint=journal_cleanup call=%s category=%s", identity, type(exc).__name__)
+
+    async def recovery_worker(self, *, task_status: TaskStatus[None]) -> None:
+        try:
+            await self.recover()
+        except (PrismaError, RedisError, ValidationError, TimeoutError) as exc:
+            _LOG.warning("checkpoint=journal_startup category=%s", type(exc).__name__)
+            self.wake.set()
+        task_status.started()
+        while True:
+            await self.wake.wait()
+            self.wake.clear()
+            try:
+                await self.recover()
+            except (PrismaError, RedisError, ValidationError, TimeoutError) as exc:
+                _LOG.warning("checkpoint=journal_replay category=%s", type(exc).__name__)
+                await anyio.sleep(0.5)
+                self.wake.set()
 
     async def finish(self, entry: Reservation, usage: tuple[int, int, int] | None, status: str = "success") -> None:
-        async with self.gate:
-            if usage is None:
-                self.active.pop(entry.call_id, None)
-                return
-            prompt, completion, cached = usage
-            binding: Final = entry.binding
-            ended: Final = self.clock()
-            fee: Final = Fee(
-                call_id=entry.call_id,
-                token=binding.token,
-                organization_id=binding.organization_id,
-                user_id=binding.user_id,
-                team_id=binding.team_id,
-                tags=binding.metadata.tags,
-                started=entry.started,
-                ended=ended,
-                amount=entry.deployment.cost(prompt, completion, entry.started, cached),
-                prompt=prompt,
-                completion=completion,
-                model=entry.deployment.model_name,
-                model_id=entry.deployment.model_id,
-                provider=entry.deployment.provider,
-                duration_ms=max(0, int((ended - entry.started).total_seconds() * 1000)),
-                status=status,
-                cached=cached,
-            )
-            self.undelivered[fee.call_id] = fee
-            self.active.pop(entry.call_id, None)
-            durable: Final = await self.save_pending(fee)
-            try:
+        if not self.release(entry.call_id) or usage is None:
+            return
+        prompt, completion, cached = usage
+        binding: Final = entry.binding
+        ended: Final = self.clock()
+        fee: Final = Fee(
+            call_id=entry.call_id,
+            token=binding.token,
+            organization_id=binding.organization_id,
+            user_id=binding.user_id,
+            team_id=binding.team_id,
+            tags=binding.metadata.tags,
+            started=entry.started,
+            ended=ended,
+            amount=entry.deployment.cost(prompt, completion, entry.started, cached),
+            prompt=prompt,
+            completion=completion,
+            model=entry.deployment.model_name,
+            model_id=entry.deployment.model_id,
+            provider=entry.deployment.provider,
+            duration_ms=max(0, int((ended - entry.started).total_seconds() * 1000)),
+            status=status,
+            cached=cached,
+        )
+        self.note_fee(fee)
+        try:
+            with anyio.fail_after(2):
                 await self.commit(fee)
-            except (PrismaError, TimeoutError) as exc:
-                _LOG.warning(
-                    "checkpoint=settlement call=%s category=%s durable=%s", fee.call_id, type(exc).__name__, durable
-                )
-                if not durable:
-                    raise PublicError(503, _UNAVAILABLE) from exc
-                return
-            self.undelivered.pop(fee.call_id, None)
-            if durable:
-                try:
-                    await self.redis.execute_command("HDEL", _PENDING, fee.call_id)
-                except RedisError as exc:
-                    _LOG.warning("checkpoint=journal_cleanup call=%s category=%s", fee.call_id, type(exc).__name__)
+        except (PrismaError, TimeoutError) as exc:
+            durable: Final = await self.save_pending(fee)
+            self.retryable.add(fee.call_id)
+            self.wake.set()
+            _LOG.warning(
+                "checkpoint=settlement call=%s category=%s durable=%s", fee.call_id, type(exc).__name__, durable
+            )
+            if not durable:
+                self.volatile.add(fee.call_id)
+                raise PublicError(503, _UNAVAILABLE) from exc
+            return
+        self.clear_fee(fee.call_id)
+
+    async def remove_pending(self, call_id: str) -> None:
+        with anyio.fail_after(2):
+            await self.redis.hdel(_PENDING, call_id)  # pyright: ignore[reportGeneralTypeIssues, reportUnknownMemberType]  # Redis unions sync and async
 
     async def save_pending(self, fee: Fee) -> bool:
         try:
-            async with self.redis.pipeline(transaction=False) as pipeline:
-                pipeline.execute_command("HSET", _PENDING, fee.call_id, fee.model_dump_json())
-                pipeline.execute_command("WAITAOF", 1, 0, 1000)
-                _, (local, _) = _AOF_ACK.validate_python(await pipeline.execute())  # pyright: ignore[reportUnknownMemberType]  # Redis stub lacks its response type
-                return local == 1
-        except (RedisError, ValidationError) as exc:
+            with anyio.fail_after(2):
+                async with self.redis.pipeline(transaction=False) as pipeline:
+                    pipeline.hset(_PENDING, fee.call_id, fee.model_dump_json())  # pyright: ignore[reportUnknownMemberType]  # Redis stub shares its async and sync commands
+                    pipeline.execute_command("WAITAOF", 1, 0, 1000)  # pyright: ignore[reportUnknownMemberType]  # queued on the same connection as HSET
+                    _, (local, _) = _AOF_ACK.validate_python(await pipeline.execute())  # pyright: ignore[reportUnknownMemberType]  # Redis stub lacks its response type
+                    return local == 1
+        except (RedisError, ValidationError, TimeoutError) as exc:
             _LOG.error("checkpoint=fee_recovery call=%s category=%s", fee.call_id, type(exc).__name__)
             return False
