@@ -137,7 +137,7 @@ _AOF_ACK: Final = TypeAdapter(tuple[object, tuple[int, int]])
 
 
 class Ledger:
-    def __init__(self, db: Database, redis: Redis, clock: Callable[[], datetime]) -> None:
+    def __init__(self, db: Database, redis: "Redis[str | bytes]", clock: Callable[[], datetime]) -> None:
         self.db = db
         self.redis = redis
         self.clock = clock

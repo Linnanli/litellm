@@ -361,8 +361,8 @@ test-llm-translation-flush-vcr-cache:
 
 .PHONY: check-daswork
 check-daswork:
-	$(DASWORK_RUN) ruff format --check daswork_enterprise scripts/check_daswork_imports.py
-	$(DASWORK_RUN) ruff check daswork_enterprise scripts/check_daswork_imports.py
+	$(DASWORK_RUN) ruff format --check daswork_enterprise scripts/check_daswork_imports.py scripts/check_daswork_core_types.py
+	$(DASWORK_RUN) ruff check daswork_enterprise scripts/check_daswork_imports.py scripts/check_daswork_core_types.py
 	$(DASWORK_RUN) ruff check --config ruff-strict.toml daswork_enterprise
 	$(DASWORK_RUN) ruff check --config ruff-tests.toml daswork_enterprise/tests
 	$(DASWORK_RUN) basedpyright --project pyrightconfig.daswork.json --pythonpath .venv/bin/python
@@ -372,7 +372,7 @@ check-daswork:
 	@changed=$$($(DASWORK_RUN) python scripts/check_daswork_imports.py --core-paths) && \
 	if [ -n "$$changed" ]; then \
 		$(DASWORK_RUN) ruff format --check $$changed && $(DASWORK_RUN) ruff check $$changed && \
-		$(DASWORK_RUN) basedpyright --project pyrightconfig.daswork.json --pythonpath .venv/bin/python $$changed; \
+		$(DASWORK_RUN) python scripts/check_daswork_core_types.py --pythonpath .venv/bin/python; \
 	fi
 
 DASWORK_RUN ?= uv run --frozen --extra proxy --extra extra_proxy --extra proxy-runtime

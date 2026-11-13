@@ -12,7 +12,7 @@ import httpx
 from fastapi import APIRouter, Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from prisma.errors import PrismaError, UniqueViolationError
-from redis.asyncio import Redis
+from redis.asyncio import Redis, RedisCluster
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -73,7 +73,7 @@ def gateway_lifespan(
             coordination: Final = proxy_server.redis_usage_cache
             if coordination is None:
                 raise RuntimeError("LiteLLM coordination Redis is required")
-            redis: Final = coordination.init_async_client()
+            redis: Final[Redis[str | bytes] | RedisCluster[str | bytes]] = coordination.init_async_client()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # native cache omits Redis's response type
             if not isinstance(redis, Redis):
                 raise TypeError("Daswork requires standalone coordination Redis")
             db: Final = Database(writer.prisma.writer_db)
