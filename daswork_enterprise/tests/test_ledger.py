@@ -1,5 +1,5 @@
 import os
-from collections.abc import Sequence
+from collections.abc import AsyncGenerator, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from re import sub
@@ -7,20 +7,28 @@ from typing import Final, Literal
 from uuid import uuid4
 
 import anyio
+import httpx
 import pytest
 from anyio.lowlevel import checkpoint_if_cancelled
 from prisma.errors import PrismaError
 from psycopg import AsyncConnection
 from psycopg.rows import DictRow, dict_row
-from pydantic import TypeAdapter
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
+from daswork_enterprise.app import admission_dep, create_app, ledger_dep
 from daswork_enterprise.batching import Batcher
 from daswork_enterprise.contracts import JsonObject, PublicError, month_start
 from daswork_enterprise.ledger import Fee, Ledger
 from daswork_enterprise.models import Deployment
+from daswork_enterprise.security import Admission
+from daswork_enterprise.settings import Settings
 from daswork_enterprise.storage import Database
-from litellm import Router
+from litellm import APIConnectionError, AuthenticationError, BadRequestError, RateLimitError, Router
+from litellm.litellm_core_utils.litellm_logging import Logging
+from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+from litellm.responses.streaming_iterator import ResponsesAPIStreamingIterator
 from litellm.types.utils import ModelInfo
 
 _NOW: Final = datetime(2026, 11, 25, tzinfo=UTC)
@@ -137,6 +145,63 @@ class CoordinatedLedger(Ledger):
         return self.redis_ok
 
 
+class RecordingDatabase(BudgetDatabase):
+    def __init__(self) -> None:
+        super().__init__("1", None)
+        self.fees: Final = list[Fee]()
+
+    async def rows(self, statement: str, parameters: Sequence[object] = ()) -> tuple[JsonObject, ...]:
+        if len(parameters) == 1:
+            payload: Final = parameters[0]
+            assert isinstance(payload, str)
+            self.fees.extend(_FEES.validate_json(payload, extra="ignore"))
+        return await super().rows(statement, parameters)
+
+
+class SyntheticResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    status: str
+    usage: JsonObject | None = None
+
+
+class SyntheticEvent(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    type: str
+    response: JsonObject
+
+
+def failed_provider_stream() -> ResponsesAPIStreamingIterator:
+    model: Final = "gpt-4o"
+    response: Final[dict[str, JsonValue]] = {  # mutable-ok: nested JsonValue uses a dict
+        "id": "resp_synthetic",
+        "model": model,
+        "created_at": 10,
+        "output": [],
+    }
+    frames: Final[tuple[JsonObject, ...]] = (
+        {"type": "response.created", "response": response},
+        {
+            "type": "response.failed",
+            "response": {
+                **response,
+                "status": "failed",
+                "error": {"code": "rate_limit_exceeded", "message": "private-provider-credential"},
+                "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+            },
+        },
+    )
+    adapter: Final = TypeAdapter(JsonObject)
+    body: Final = b"".join(b"data: " + adapter.dump_json(frame) + b"\n\n" for frame in frames)
+    return ResponsesAPIStreamingIterator(
+        response=httpx.Response(200, content=body),
+        model=model,
+        responses_api_provider_config=OpenAIResponsesAPIConfig(),
+        logging_obj=Logging(model, "hello", True, "aresponses", _NOW, "synthetic-call", "synthetic-function"),
+        custom_llm_provider="openai",
+        request_data={"input": "hello"},
+    )
+
+
 class InvalidBindingDatabase(BudgetDatabase):
     def snapshot(self, token: str, window: str) -> JsonObject:
         row: Final = super().snapshot(token, window)
@@ -177,6 +242,121 @@ class FixedDeployment(Deployment):
 
 def fixed_deployment(organization_id: str, team_id: str, model: str) -> Deployment:
     return FixedDeployment(Router(model_list=[]), "deployment", model, "synthetic", "openai", _PRICE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "http_status", "failure_code", "amount"),
+    (
+        ("rate_limit", 429, "429", 0),
+        ("bad_request", 400, "400", 0),
+        ("credentials", 502, "401", 0),
+        ("connection", 502, "502", 0),
+        ("failed_response", 200, "provider_response_failed", 0),
+        ("failed_with_usage", 200, "provider_response_failed", 5),
+        ("before_first_frame", 429, "429", 0),
+        ("after_first_frame", 200, "429", 0),
+        ("native_failed_frame", 200, "429", 5),
+        ("hook_denied", 403, None, 0),
+    ),
+)
+async def test_responses_failure_status_and_accounting(
+    monkeypatch: pytest.MonkeyPatch, scenario: str, http_status: int, failure_code: str | None, amount: int
+) -> None:
+    monkeypatch.setattr("daswork_enterprise.ledger.resolve_deployment", fixed_deployment)
+    provider_message: Final = "private-provider-credential"
+    exceptions: Final = {
+        "rate_limit": RateLimitError(provider_message, "openai", _MODEL),
+        "bad_request": BadRequestError(provider_message, "openai", _MODEL),
+        "credentials": AuthenticationError(provider_message, "openai", _MODEL),
+        "connection": APIConnectionError(provider_message, "openai", _MODEL),
+    }
+
+    async def stream() -> AsyncGenerator[SyntheticEvent, None]:
+        if scenario == "after_first_frame":
+            yield SyntheticEvent(
+                type="response.created", response={"id": "resp_synthetic", "model": _MODEL, "created_at": 10}
+            )
+        raise exceptions["rate_limit"]
+
+    class SyntheticRouting:
+        def __init__(self, router: Router) -> None:
+            pass
+
+        async def aresponses(
+            self,
+            **options: object,  # kwargs-ok: match the router endpoint accepting provider parameters
+        ) -> SyntheticResponse | AsyncGenerator[SyntheticEvent, None] | ResponsesAPIStreamingIterator:
+            if scenario in exceptions:
+                raise exceptions[scenario]
+            if scenario == "hook_denied":
+                pytest.fail("Admission denial reached the provider")
+            if scenario in {"before_first_frame", "after_first_frame"}:
+                return stream()
+            if scenario == "native_failed_frame":
+                return failed_provider_stream()
+            usage: Final = {"input_tokens": 3, "output_tokens": 2} if scenario == "failed_with_usage" else None
+            return SyntheticResponse(status="failed", usage=usage)
+
+    class SyntheticAdmission(Admission):
+        async def check(self, presented: str, call_id: str) -> None:
+            if scenario == "hook_denied":
+                raise PublicError(403, "synthetic_denial")
+
+    monkeypatch.setattr("daswork_enterprise.inference.RoutingContext", SyntheticRouting)
+    database: Final = RecordingDatabase()
+    app: Final = create_app(
+        Settings.model_validate(
+            {
+                "config": {"general_settings": {"coordination_redis": {"host": "localhost"}}},
+                "database_url": "postgresql://localhost/synthetic",
+                "master_key": "synthetic-master",
+                "admission_endpoint": "https://localhost/admission",
+                "admission_ca": "/synthetic-ca.pem",
+            }
+        )
+    )
+    async with (
+        Redis(decode_responses=False) as redis,
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+    ):
+        ledger: Final = CoordinatedLedger(database, redis, lambda: _NOW)  # pyright: ignore[reportArgumentType]  # the Redis stub is invariant
+        ledger.ready = True
+        app.dependency_overrides[ledger_dep] = lambda: ledger
+        app.dependency_overrides[admission_dep] = lambda: SyntheticAdmission(client, "https://test/admission")
+        response: Final = await client.post(
+            "/v1/responses",
+            json={"model": _MODEL, "input": "hello", "stream": scenario.endswith("_frame")},
+            headers={"authorization": "Bearer synthetic-key"},
+        )
+        assert response.status_code == http_status
+        assert provider_message not in response.text
+        if scenario in {"after_first_frame", "native_failed_frame"}:
+            payloads: Final = TypeAdapter(JsonObject)
+            created, failed = (
+                payloads.validate_json(line.removeprefix("data: "))
+                for line in response.text.splitlines()
+                if line.startswith("data: ") and line != "data: [DONE]"
+            )
+            initial: Final = created["response"]
+            terminal: Final = failed["response"]
+            assert isinstance(initial, dict) and isinstance(terminal, dict)
+            assert initial["id"] == terminal["id"]
+            assert "event: response.failed" in response.text
+            assert "rate_limit_exceeded" in response.text
+        if failure_code is None:
+            assert database.fees == []
+        else:
+            (fee,) = database.fees
+            assert fee.call_id == response.headers["x-litellm-call-id"]
+            assert fee.status == "failure"
+            assert fee.error_code == failure_code
+            assert fee.amount == amount
+            assert fee.prompt + fee.completion == amount
+            assert fee.organization_id == "org"
+            assert fee.tags == ("parent", f"leaf-{fee.user_id}")
+        assert database.balance == amount
+        assert not ledger.reserved
 
 
 @pytest.mark.asyncio
@@ -366,11 +546,14 @@ async def test_replay_batches_persisted_duplicate_and_mixed_months(monkeypatch: 
     current: Final = month_start(_NOW)
     prior: Final = month_start(current - timedelta(seconds=1))
     persisted: Final = settlement_fee("current-already-persisted", "first", 2, current)
+    failed: Final = settlement_fee("failed-request", "failed-user", 0, current).model_copy(
+        update={"status": "failure", "error_code": "429"}
+    )
     old_first: Final = settlement_fee("old-first", "first", 9, prior)
     old_third: Final = settlement_fee("old-third", "third", 7, prior)
     current_first: Final = settlement_fee("current-first", "first", 3, current)
     current_second: Final = settlement_fee("current-second", "second", 5, current)
-    entries: Final = (persisted, old_first, current_first, old_third, current_second)
+    entries: Final = (persisted, old_first, current_first, old_third, current_second, failed)
 
     async with (
         await AsyncConnection[DictRow].connect(dsn, autocommit=True, row_factory=dict_row) as connection,
@@ -392,6 +575,12 @@ async def test_replay_batches_persisted_duplicate_and_mixed_months(monkeypatch: 
 
         cursor: Final = await connection.execute('SELECT request_id,spend FROM "LiteLLM_SpendLogs"')
         spend: Final = {row["request_id"]: row["spend"] for row in _ROWS.validate_python(await cursor.fetchall())}
+        failure: Final = await connection.execute(
+            """SELECT status, metadata #>> '{error_information,error_code}' AS code
+               FROM "LiteLLM_SpendLogs" WHERE request_id = %s""",
+            (failed.call_id,),
+        )
+        assert await failure.fetchone() == {"status": "failure", "code": "429"}
         window_query: Final = """
         SELECT entity_id,window_start::text AS month,spend FROM "LiteLLM_BudgetWindowSpend"
         WHERE entity_type='tag' OR entity_type='organization'
@@ -413,6 +602,53 @@ async def test_replay_batches_persisted_duplicate_and_mixed_months(monkeypatch: 
             "leaf-second": (current_stamp, 5),
             "leaf-third": (prior_stamp, 7),
         }
+
+
+@pytest.mark.asyncio
+async def test_recovery_retries_redis_cleanup_after_postgres_commits(monkeypatch: pytest.MonkeyPatch) -> None:
+    dsn: Final = os.environ.get("DASWORK_TEST_DATABASE_URL")
+    redis_url: Final = os.environ.get("DASWORK_TEST_REDIS_URL")
+    if not dsn or not redis_url:
+        pytest.skip("PostgreSQL and Redis are required for settlement replay")
+
+    pending: Final = f"daswork:test:{uuid4()}"
+    monkeypatch.setattr("daswork_enterprise.ledger._PENDING", pending)
+    fee: Final = settlement_fee("committed-before-cleanup", "first", 7, _NOW)
+    cleaned: Final = anyio.Event()
+
+    class InterruptedCleanup(Ledger):
+        attempts = 0
+
+        async def remove_pending(self, identities: tuple[str, ...]) -> None:
+            self.attempts += 1
+            if self.attempts <= 2:
+                raise RedisError("injected journal deletion failure after commit")
+            await super().remove_pending(identities)
+            cleaned.set()
+
+    async with (
+        await AsyncConnection[DictRow].connect(dsn, autocommit=True, row_factory=dict_row) as connection,
+        Redis.from_url(redis_url, decode_responses=False) as redis,
+    ):
+        await connection.execute(_SETTLEMENT_TABLES)
+        database: Final = SettlementDatabase(connection)
+        ledger: Final = InterruptedCleanup(database, redis, lambda: _NOW)  # pyright: ignore[reportArgumentType]  # the Redis stub is invariant
+        assert await ledger.save_pending(fee)
+        try:
+            with anyio.fail_after(5):
+                async with anyio.create_task_group() as tasks:
+                    await tasks.start(ledger.recovery_worker)
+                    await cleaned.wait()
+                    tasks.cancel_scope.cancel()
+            assert await redis.exists(pending) == 0  # pyright: ignore[reportGeneralTypeIssues]  # Redis stub shares async and sync commands
+        finally:
+            await redis.delete(pending)  # pyright: ignore[reportGeneralTypeIssues]  # Redis stub shares async and sync commands
+
+        assert database.writes == 1
+        cursor: Final = await connection.execute(
+            """SELECT spend FROM "LiteLLM_BudgetWindowSpend" WHERE entity_type='organization'"""
+        )
+        assert await cursor.fetchall() == [{"spend": fee.amount}]
 
 
 @pytest.mark.asyncio

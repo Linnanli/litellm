@@ -64,7 +64,8 @@ WITH fees AS (
  SELECT * FROM jsonb_to_recordset($1::text::jsonb) AS fee(
   call_id text, token text, started timestamptz, ended timestamptz, amount double precision,
   prompt int, completion int, organization_id text, user_id text, team_id text, tags jsonb,
-  model text, model_id text, window_start timestamptz, provider text, duration_ms int, status text, cached int
+  model text, model_id text, window_start timestamptz, provider text, duration_ms int, status text, cached int,
+  error_code text
  )
 ), new_fee AS (
  INSERT INTO "LiteLLM_SpendLogs"(request_id,litellm_call_id,call_type,api_key,"startTime","endTime",spend,prompt_tokens,
@@ -75,6 +76,8 @@ WITH fees AS (
  jsonb_build_object('status',status,'usage_object',jsonb_build_object(
  'prompt_tokens',prompt,'completion_tokens',completion,'total_tokens',prompt+completion,
  'prompt_tokens_details',jsonb_build_object('cached_tokens',cached)))
+ || CASE WHEN error_code IS NULL THEN '{}'::jsonb
+         ELSE jsonb_build_object('error_information',jsonb_build_object('error_code',error_code)) END
  FROM fees ORDER BY call_id
  ON CONFLICT DO NOTHING RETURNING request_id
 ), entities AS (
@@ -84,6 +87,7 @@ WITH fees AS (
   SELECT 'organization' AS kind,fee.organization_id AS identity UNION ALL SELECT 'user',fee.user_id
   UNION ALL SELECT 'tag',jsonb_array_elements_text(fee.tags)
  ) AS scope
+ WHERE fee.amount > 0
 ), windows AS (
  SELECT kind,identity,window_start,SUM(amount) AS spend FROM entities GROUP BY kind,identity,window_start
 ), latest AS (
@@ -155,6 +159,7 @@ class Fee(Contract):
     duration_ms: int
     status: str
     cached: int
+    error_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +182,7 @@ class Ledger:
         self.reserved: Final = defaultdict[tuple[str, str], Decimal](Decimal)
         self.undelivered: Final = dict[str, Fee]()
         self.retryable: Final = set[str]()
+        self.journal_cleanup: Final = set[str]()
         self.volatile: Final = set[str]()
         self.wake: Final = asyncio.Event()
         self.ready = False
@@ -332,18 +338,18 @@ class Ledger:
             self.clear_fee(call_id)
         self.revision += 1
 
-    async def replay(self, identities: tuple[str, ...]) -> None:
-        fees: Final = tuple(self.undelivered[identity] for identity in identities)
-        await self.commit(fees)
-        try:
-            await self.remove_pending(identities)
-        except (RedisError, TimeoutError) as exc:
-            _LOG.warning(
-                "checkpoint=journal_cleanup call=%s count=%d category=%s",
-                identities[0],
-                len(identities),
-                type(exc).__name__,
-            )
+    async def clean_journal(self) -> None:
+        identities: Final = tuple(self.journal_cleanup)
+        for offset in range(0, len(identities), _BATCH_SIZE):
+            batch = identities[offset : offset + _BATCH_SIZE]
+            try:
+                await self.remove_pending(batch)
+            except (RedisError, TimeoutError) as exc:
+                _LOG.warning(
+                    "checkpoint=journal_cleanup call=%s count=%d category=%s", batch[0], len(batch), type(exc).__name__
+                )
+                raise
+            self.journal_cleanup.difference_update(batch)
 
     async def recover(self) -> None:
         if not self.ready:
@@ -359,8 +365,13 @@ class Ledger:
             self.ready = True
 
         identities: Final = tuple(self.retryable)
-        for offset in range(0, len(identities), _BATCH_SIZE):
-            await self.replay(identities[offset : offset + _BATCH_SIZE])
+        try:
+            for offset in range(0, len(identities), _BATCH_SIZE):
+                batch = identities[offset : offset + _BATCH_SIZE]
+                await self.commit(tuple(self.undelivered[call_id] for call_id in batch))
+                self.journal_cleanup.update(batch)
+        finally:
+            await self.clean_journal()
 
     async def recovery_worker(self, *, task_status: TaskStatus[None]) -> None:
         try:
@@ -379,10 +390,12 @@ class Ledger:
                 await anyio.sleep(0.5)
                 self.wake.set()
 
-    async def finish(self, entry: Reservation, usage: tuple[int, int, int] | None, status: str = "success") -> None:
-        if not self.release(entry.call_id) or usage is None:
+    async def finish(
+        self, entry: Reservation, usage: tuple[int, int, int] | None, *, error_code: str | None = None
+    ) -> None:
+        if not self.release(entry.call_id) or (usage is None and error_code is None):
             return
-        prompt, completion, cached = usage
+        prompt, completion, cached = usage or (0, 0, 0)
         binding: Final = entry.binding
         ended: Final = self.clock()
         fee: Final = Fee(
@@ -394,15 +407,18 @@ class Ledger:
             tags=binding.metadata.tags,
             started=entry.started,
             ended=ended,
-            amount=entry.deployment.cost(prompt, completion, entry.started, cached),
+            amount=entry.deployment.cost(prompt, completion, entry.started, cached)
+            if usage is not None
+            else Decimal(0),
             prompt=prompt,
             completion=completion,
             model=entry.deployment.model_name,
             model_id=entry.deployment.model_id,
             provider=entry.deployment.provider,
             duration_ms=max(0, int((ended - entry.started).total_seconds() * 1000)),
-            status=status,
+            status="failure" if error_code is not None else "success",
             cached=cached,
+            error_code=error_code,
         )
         self.note_fee(fee)
         with anyio.CancelScope(shield=True):

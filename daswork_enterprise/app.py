@@ -120,7 +120,12 @@ def create_app(
 
     @app.exception_handler(PublicError)
     async def public_error(_: Request, error: PublicError) -> JSONResponse:
-        return JSONResponse({"error": {"message": str(error), "type": error.category}}, status_code=error.status)
+        headers: Final = (
+            {inference.LITELLM_CALL_ID_HEADER: error.call_id} if isinstance(error, inference.ProviderError) else None
+        )
+        return JSONResponse(
+            {"error": {"message": str(error), "type": error.category}}, status_code=error.status, headers=headers
+        )
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(_: Request, __: RequestValidationError) -> JSONResponse:  # pyright: ignore[reportUnusedFunction]  # registered by the FastAPI decorator
