@@ -14,7 +14,7 @@ from .ledger import Ledger, Reservation
 from .security import Admission, reject_attribution
 
 _JSON: Final = TypeAdapter(dict[str, JsonValue])
-_CLIENT_METADATA: Final = TypeAdapter(Mapping[str, str] | None)
+_CLIENT_METADATA: Final[TypeAdapter[Mapping[str, str] | None]] = TypeAdapter(Mapping[str, str] | None)
 _TERMINAL: Final = frozenset({"response.completed", "response.incomplete", "response.failed"})
 _PROVIDER_OPTIONS: Final = frozenset(
     {
