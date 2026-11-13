@@ -170,12 +170,14 @@ def _activity(
 
 
 def build_reporting_router(
-    *, require_master_key: Callable[..., Awaitable[None]], get_query: Callable[[], ReportingQuery]
+    *,
+    require_master_key: Callable[..., Awaitable[None]],
+    get_query: Callable[..., ReportingQuery | Awaitable[ReportingQuery]],
 ) -> APIRouter:
     router: Final = APIRouter(dependencies=[Depends(require_master_key)])
 
     @router.get("/organization/daily/activity/aggregated")
-    async def organization_activity(
+    async def organization_activity(  # pyright: ignore[reportUnusedFunction]  # registered by the FastAPI decorator
         query: Annotated[ReportingQuery, Depends(get_query)],
         organization_ids: Annotated[str, Query(min_length=1)],
         start_date: str,
@@ -198,7 +200,7 @@ def build_reporting_router(
         return _activity(rows, organization_ids, page=1, page_size=1, api_key_limit=api_key_limit)
 
     @router.get("/tag/daily/activity")
-    async def tag_activity(
+    async def tag_activity(  # pyright: ignore[reportUnusedFunction]  # registered by the FastAPI decorator
         query: Annotated[ReportingQuery, Depends(get_query)],
         tags: Annotated[str, Query(min_length=1)],
         start_date: str,
@@ -223,7 +225,7 @@ def build_reporting_router(
         return _activity(rows, tags, page=page, page_size=page_size)
 
     @router.get("/organization/daily/activity/export", response_class=StreamingResponse)
-    async def organization_export(
+    async def organization_export(  # pyright: ignore[reportUnusedFunction]  # registered by the FastAPI decorator
         query: Annotated[ReportingQuery, Depends(get_query)],
         organization_ids: Annotated[str, Query(min_length=1)],
         start_date: str,

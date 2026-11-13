@@ -224,14 +224,14 @@ def test_organization_uses_recorded_ownership_and_utc_dates(reports: TestClient)
     assert metadata["total_api_requests"] == 4
     assert metadata["total_prompt_tokens"] == 3_000_000_040
     assert isinstance(metadata["total_prompt_tokens"], int)
-    assert metadata["total_spend"] == pytest.approx(0.078)
+    assert metadata["total_spend"] == pytest.approx(0.078)  # pyright: ignore[reportUnknownMemberType]  # pytest accepts numeric values
     assert metadata["total_response_time_ms"] == 69
     assert metadata["total_timed_requests"] == 3
     assert [day["date"] for day in days] == ["2026-11-14", "2026-11-13"]
 
     breakdown: Final = _OBJECT.validate_python(days[1]["breakdown"])
     day: Final = _OBJECT.validate_python(days[1]["metrics"])
-    assert day["spend"] == pytest.approx(0.052)
+    assert day["spend"] == pytest.approx(0.052)  # pyright: ignore[reportUnknownMemberType]  # pytest accepts numeric values
     assert day["api_requests"] == 2
     assert day["successful_requests"] == day["failed_requests"] == 1
     assert day["prompt_tokens"] == 40
@@ -251,9 +251,9 @@ def test_tag_pages_by_requests_and_preserves_old_department(reports: TestClient)
     new, new_days = _read_report(reports, _TAG, tags="new")
     parent, parent_days = _read_report(reports, _TAG, tags="parent")
     assert (old["total_api_requests"], new["total_api_requests"], parent["total_api_requests"]) == (1, 2, 3)
-    assert old["total_spend"] == pytest.approx(0.026)
-    assert new["total_spend"] == pytest.approx(0.052)
-    assert parent["total_spend"] == pytest.approx(0.078)
+    assert old["total_spend"] == pytest.approx(0.026)  # pyright: ignore[reportUnknownMemberType]  # pytest accepts numeric values
+    assert new["total_spend"] == pytest.approx(0.052)  # pyright: ignore[reportUnknownMemberType]  # pytest accepts numeric values
+    assert parent["total_spend"] == pytest.approx(0.078)  # pyright: ignore[reportUnknownMemberType]  # pytest accepts numeric values
     for tag, days in (("old", old_days), ("new", new_days), ("parent", parent_days)):
         for day in days:
             breakdown = _OBJECT.validate_python(day["breakdown"])

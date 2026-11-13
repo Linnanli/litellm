@@ -3,8 +3,8 @@
 候选在 LiteLLM Proxy 的路由组装阶段调用一次
 `build_reporting_router(require_master_key=..., get_query=...)`。三个报表 GET
 都使用候选的 Master Key 依赖。缺少凭据时返回 401，普通会话 Key 返回 403。
-`get_query` 返回已连接的共享 Prisma 客户端 `db.query_raw`。启用写库读取时用
-`writer_db.query_raw`，以便结算后的读回能立即看到已提交的行。候选只注册下面
+`get_query` 从请求状态借用 Proxy 已连接的 `writer_db`，复用 `Database.rows` 执行查询，
+使结算后的读回能立即看到已提交的行。候选只注册下面
 三个 URL 各一次，排除原生同名日表路由。
 
 | 路由 | 读取 |
@@ -35,12 +35,12 @@
 `DASWORK_REPORTING_TEST_DSN` 指向可建临时表的测试 PostgreSQL。
 
 ```sh
-ruff format --check daswork_enterprise/reporting.py daswork_enterprise/reporting_sql.py daswork_enterprise/test_reporting.py
-ruff check --config ruff-strict.toml daswork_enterprise/reporting.py daswork_enterprise/reporting_sql.py daswork_enterprise/test_reporting.py
-ruff check --config ruff-tests.toml daswork_enterprise/test_reporting.py
-python scripts/check_type_discipline.py daswork_enterprise/reporting.py daswork_enterprise/reporting_sql.py daswork_enterprise/test_reporting.py
-basedpyright daswork_enterprise/reporting.py daswork_enterprise/reporting_sql.py daswork_enterprise/test_reporting.py
-python -m pytest --import-mode=importlib -q daswork_enterprise/test_reporting.py
+ruff format --check daswork_enterprise/reporting.py daswork_enterprise/reporting_sql.py daswork_enterprise/tests/test_reporting.py
+ruff check --config ruff-strict.toml daswork_enterprise/reporting.py daswork_enterprise/reporting_sql.py daswork_enterprise/tests/test_reporting.py
+ruff check --config ruff-tests.toml daswork_enterprise/tests/test_reporting.py
+python scripts/check_type_discipline.py daswork_enterprise/reporting.py daswork_enterprise/reporting_sql.py daswork_enterprise/tests/test_reporting.py
+basedpyright daswork_enterprise/reporting.py daswork_enterprise/reporting_sql.py daswork_enterprise/tests/test_reporting.py
+python -m pytest --import-mode=importlib -q daswork_enterprise/tests/test_reporting.py
 ```
 
 本批在真实 PostgreSQL 17 和 FastAPI 上以合成数据验证读查询、响应和 CSV。临时测试引导程序

@@ -16,6 +16,8 @@ from redis.asyncio import Redis
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from litellm.proxy.deps.database import DatabaseDep
+
 from . import inference
 from .contracts import (
     BudgetLookup,
@@ -39,6 +41,7 @@ from .contracts import (
     UserUpdate,
 )
 from .ledger import Ledger
+from .reporting import ReportingQuery, build_reporting_router
 from .security import Admission, admission_client, bearer, fingerprint
 from .settings import Settings
 from .storage import Database
@@ -105,13 +108,14 @@ def create_app(
         lifespan=gateway_lifespan(config, clock, hook_transport), docs_url=None, redoc_url=None, openapi_url=None
     )
 
-    def master(request: Request) -> None:
+    async def master(request: Request) -> None:
         headers: Final = tuple(request.headers.items())
         key: Final = bearer(headers)
         if not compare_digest(key.encode(), config.master_key.get_secret_value().encode()):
             raise PublicError(403, "master_key_required")
 
     app.include_router(management(master))
+    app.include_router(build_reporting_router(require_master_key=master, get_query=report_reader))
 
     @app.exception_handler(PublicError)
     async def public_error(_: Request, error: PublicError) -> JSONResponse:
@@ -146,13 +150,24 @@ def create_app(
         if not is_native_management(request.method, request.url.path):
             return await call_next(request)
         try:
-            master(request)
+            await master(request)
         except PublicError as error:
             return await public_error(request, error)
         return await call_next(request)
 
     app.mount("/", NativeManagement(proxy_server.app))
     return app
+
+
+async def report_reader(database: DatabaseDep) -> ReportingQuery:
+    if database is None:
+        raise PublicError(503, "database_unavailable")
+    reader: Final = Database(database.prisma.writer_db)
+
+    async def query(statement: str, *values: object) -> tuple[JsonObject, ...]:
+        return await reader.rows(statement, values)
+
+    return query
 
 
 def subjects_dep(request: Request) -> Subjects:
@@ -181,7 +196,7 @@ LedgerDep: TypeAlias = Annotated[Ledger, Depends(ledger_dep)]
 AdmissionDep: TypeAlias = Annotated[Admission, Depends(admission_dep)]
 
 
-def management(master: Callable[[Request], None]) -> APIRouter:  # noqa: C901  # the declarations below register HTTP operations
+def management(master: Callable[[Request], Awaitable[None]]) -> APIRouter:  # noqa: C901  # the declarations below register HTTP operations
     router: Final = APIRouter(dependencies=[Depends(master)])
 
     @router.post("/budget/new")
@@ -286,6 +301,7 @@ _NATIVE_FIXED: Final = frozenset(
     {
         ("GET", "/model/info"),
         ("GET", "/v1/model/info"),
+        ("GET", "/health"),
         ("GET", "/utils/model_info"),
         ("GET", "/model/cost_map/source"),
         ("POST", "/reload/model_cost_map"),

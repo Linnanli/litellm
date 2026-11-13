@@ -182,14 +182,31 @@ class Ledger:
                     revision = self.revision
                     now = self.clock()
                     binding = await self.lookup(presented, model, path, now)
+                    redis_ok = await self.check_coordination()
                     if self.revision == revision:
-                        return self.hold(binding, model, call_id, request, completion, now)
+                        return self.hold(binding, model, call_id, request, completion, now, redis_ok)
         except (PrismaError, ValidationError, TimeoutError) as exc:
             _LOG.warning("checkpoint=admission call=%s category=%s", call_id, type(exc).__name__)
             raise PublicError(503, _UNAVAILABLE) from exc
 
+    async def check_coordination(self) -> bool:
+        try:
+            with anyio.fail_after(0.4):
+                reply: Final[object] = await self.redis.ping()  # pyright: ignore[reportAny, reportGeneralTypeIssues, reportUnknownMemberType]  # Redis unions sync and async
+                return reply is True
+        except (RedisError, TimeoutError) as exc:
+            _LOG.warning("checkpoint=coordination category=%s", type(exc).__name__)
+            return False
+
     def hold(
-        self, binding: Binding, model: str, call_id: str, request: str, completion: int | None, now: datetime
+        self,
+        binding: Binding,
+        model: str,
+        call_id: str,
+        request: str,
+        completion: int | None,
+        now: datetime,
+        redis_ok: bool,
     ) -> Reservation:
         # The writer may have committed a fee while its reply is in flight. The
         # binding read records which pending IDs its spend snapshot already includes.
@@ -206,7 +223,7 @@ class Ledger:
             for limit in binding.limits
         ):
             raise PublicError(422, "budget_exceeded")
-        if not self.ready or self.volatile:
+        if not redis_ok or not self.ready or self.volatile:
             raise PublicError(503, _UNAVAILABLE)
         reservation: Final = Reservation(binding, deployment, now, estimate, call_id)
         self.active[call_id] = reservation
