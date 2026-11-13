@@ -56,3 +56,5 @@ litellm/rust_bridge/_native*.so
 *.log
 .env
 .env.local
+.tool-cache/
+daswork_enterprise/tests/
